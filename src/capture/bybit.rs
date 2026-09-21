@@ -26,7 +26,7 @@ pub async fn run(context: CaptureContext) -> anyhow::Result<()> {
 async fn connect_once(context: CaptureContext) -> anyhow::Result<()> {
     let url = std::env::var("BYBIT_WS_URL")
         .unwrap_or_else(|_| "wss://stream.bybit.com/v5/public/spot".to_string());
-    let (mut socket, _) = connect_async(&url)
+    let (mut socket, _) = connect_async(url.as_str())
         .await
         .with_context(|| format!("connect Bybit websocket: {url}"))?;
 
@@ -35,7 +35,7 @@ async fn connect_once(context: CaptureContext) -> anyhow::Result<()> {
         "args": [
             format!("publicTrade.{}", context.symbol),
             format!("tickers.{}", context.symbol),
-            format!("orderbook.200.{}", context.symbol),
+            format!("orderbook.full.{}", context.symbol),
             format!("kline.1.{}", context.symbol)
         ]
     });
@@ -43,11 +43,21 @@ async fn connect_once(context: CaptureContext) -> anyhow::Result<()> {
         .send(Message::Text(subscribe.to_string().into()))
         .await?;
 
+    // Subscribe before taking the REST snapshot so full-depth deltas can queue in
+    // the socket. Persisted snapshot u/seq plus subsequent deltas allow exact
+    // replay according to Bybit's documented synchronization procedure.
+    capture_snapshot(&context).await?;
+
     let (mut write, mut read) = socket.split();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    tracing::info!(exchange = "bybit", symbol = %context.symbol, "websocket connected");
+    tracing::info!(
+        exchange = "bybit",
+        symbol = %context.symbol,
+        depth = "full+10000-snapshot",
+        "websocket connected"
+    );
 
     loop {
         tokio::select! {
@@ -81,6 +91,57 @@ async fn connect_once(context: CaptureContext) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+async fn capture_snapshot(context: &CaptureContext) -> anyhow::Result<()> {
+    let rest_base = std::env::var("BYBIT_REST_BASE")
+        .unwrap_or_else(|_| "https://api.bybit.com".to_string());
+    let url = format!(
+        "{rest_base}/v5/market/full_orderbook?category=spot&symbol={}",
+        context.symbol
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()?;
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .context("fetch Bybit full depth snapshot")?
+        .error_for_status()
+        .context("Bybit full depth snapshot HTTP error")?;
+    let root: Value = response.json().await?;
+
+    let ret_code = root.get("retCode").and_then(Value::as_i64).unwrap_or(-1);
+    if ret_code != 0 {
+        anyhow::bail!(
+            "Bybit full depth snapshot rejected: {}",
+            root.get("retMsg").and_then(Value::as_str).unwrap_or("unknown")
+        );
+    }
+
+    let data = root.get("result").cloned().unwrap_or(Value::Null);
+    let ts = data
+        .get("ts")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(now_ms);
+    let event = MarketEvent {
+        exchange: Exchange::Bybit,
+        symbol: context.symbol.clone(),
+        kind: "depth_snapshot".to_string(),
+        event_ts: ts,
+        received_ts: now_ms(),
+        price: None,
+        qty: None,
+        side: None,
+        bid_price: nested_number(data.get("b"), 0, 0),
+        bid_qty: nested_number(data.get("b"), 0, 1),
+        ask_price: nested_number(data.get("a"), 0, 0),
+        ask_qty: nested_number(data.get("a"), 0, 1),
+        raw_json: data.to_string(),
+    };
+    context.emit(event).await
 }
 
 fn normalize(topic: &str, root: &Value, symbol: &str) -> Vec<MarketEvent> {
