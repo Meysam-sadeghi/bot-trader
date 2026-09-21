@@ -5,12 +5,17 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 use std::{str::FromStr, time::Duration};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+
+enum WriterCommand {
+    Event(MarketEvent),
+    Flush(oneshot::Sender<()>),
+}
 
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
-    writer: mpsc::Sender<MarketEvent>,
+    writer: mpsc::Sender<WriterCommand>,
 }
 
 impl Database {
@@ -87,16 +92,29 @@ impl Database {
         Ok(())
     }
 
-    fn spawn_writer(pool: SqlitePool, mut rx: mpsc::Receiver<MarketEvent>) {
+    fn spawn_writer(pool: SqlitePool, mut rx: mpsc::Receiver<WriterCommand>) {
         tokio::spawn(async move {
-            while let Some(first) = rx.recv().await {
+            while let Some(command) = rx.recv().await {
+                let first = match command {
+                    WriterCommand::Event(event) => event,
+                    WriterCommand::Flush(done) => {
+                        let _ = done.send(());
+                        continue;
+                    }
+                };
+
                 let mut batch = Vec::with_capacity(256);
                 batch.push(first);
                 let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+                let mut barrier = None;
 
                 while batch.len() < 256 {
                     match tokio::time::timeout_at(deadline, rx.recv()).await {
-                        Ok(Some(event)) => batch.push(event),
+                        Ok(Some(WriterCommand::Event(event))) => batch.push(event),
+                        Ok(Some(WriterCommand::Flush(done))) => {
+                            barrier = Some(done);
+                            break;
+                        }
                         _ => break,
                     }
                 }
@@ -105,6 +123,9 @@ impl Database {
                     Ok(tx) => tx,
                     Err(error) => {
                         tracing::error!(%error, "database begin failed");
+                        if let Some(done) = barrier {
+                            let _ = done.send(());
+                        }
                         continue;
                     }
                 };
@@ -145,15 +166,52 @@ impl Database {
                 } else if let Err(error) = tx.commit().await {
                     tracing::error!(%error, "database commit failed");
                 }
+
+                if let Some(done) = barrier {
+                    let _ = done.send(());
+                }
             }
         });
     }
 
     pub async fn insert_event(&self, event: MarketEvent) -> anyhow::Result<()> {
         self.writer
-            .send(event)
+            .send(WriterCommand::Event(event))
             .await
             .context("market event writer closed")
+    }
+
+    pub async fn flush(&self) -> anyhow::Result<()> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.writer
+            .send(WriterCommand::Flush(done_tx))
+            .await
+            .context("market event writer closed")?;
+        done_rx.await.context("market event flush cancelled")?;
+        Ok(())
+    }
+
+    pub async fn clear_exchange(&self, exchange: Exchange) -> anyhow::Result<(u64, u64)> {
+        self.flush().await?;
+
+        let mut tx = self.pool.begin().await?;
+        let predictions = sqlx::query("DELETE FROM predictions WHERE exchange = ?")
+            .bind(exchange.to_string())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        let events = sqlx::query("DELETE FROM market_events WHERE exchange = ?")
+            .bind(exchange.to_string())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+
+        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await;
+
+        Ok((events, predictions))
     }
 
     pub async fn count_events(&self, exchange: Exchange, symbol: &str) -> anyhow::Result<i64> {
@@ -177,10 +235,15 @@ impl Database {
         let rows = sqlx::query(
             r#"SELECT kind, received_ts, price, qty, side,
                       bid_price, bid_qty, ask_price, ask_qty
-               FROM market_events
-               WHERE exchange = ? AND symbol = ? AND received_ts >= ?
-               ORDER BY received_ts ASC
-               LIMIT ?"#,
+               FROM (
+                   SELECT id, kind, received_ts, price, qty, side,
+                          bid_price, bid_qty, ask_price, ask_qty
+                   FROM market_events
+                   WHERE exchange = ? AND symbol = ? AND received_ts >= ?
+                   ORDER BY received_ts DESC, id DESC
+                   LIMIT ?
+               ) recent
+               ORDER BY received_ts ASC, id ASC"#,
         )
         .bind(exchange.to_string())
         .bind(symbol)
@@ -231,6 +294,26 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn has_open_prediction(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        horizon_secs: i64,
+    ) -> anyhow::Result<bool> {
+        let row = sqlx::query(
+            r#"SELECT EXISTS(
+                   SELECT 1 FROM predictions
+                   WHERE exchange = ? AND symbol = ? AND horizon_secs = ? AND status = 'OPEN'
+               ) AS present"#,
+        )
+        .bind(exchange.to_string())
+        .bind(symbol)
+        .bind(horizon_secs)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.try_get::<i64, _>("present")? != 0)
     }
 
     pub async fn open_predictions(&self) -> anyhow::Result<Vec<Prediction>> {
