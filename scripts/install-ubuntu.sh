@@ -8,6 +8,8 @@ DATA_DIR="/var/lib/market-lab"
 SERVICE_NAME="market-lab"
 SERVICE_USER="marketlab"
 PORT="${MARKET_LAB_PORT:-8080}"
+ENV_FILE="/etc/market-lab.env"
+REQUEST_FILE="$DATA_DIR/update.request"
 TMP_DIR="$(mktemp -d)"
 
 cleanup() {
@@ -50,21 +52,31 @@ git clone --depth 1 --single-branch --branch "$BRANCH" \
 echo "[4/8] Building optimized release binary..."
 cd "$TMP_DIR/source"
 cargo build --release
+VERSION="$(git rev-parse HEAD)"
 
 echo "[5/8] Installing application files..."
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
-  useradd --system --home-dir "$DATA_DIR" --create-home --shell /usr/sbin/nologin "$SERVICE_USER"
+  useradd --system --home-dir "$DATA_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
 fi
 
 install -d -m 0755 "$INSTALL_DIR"
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$DATA_DIR"
 install -m 0755 target/release/market-lab "$INSTALL_DIR/market-lab"
-
 rm -rf "$INSTALL_DIR/static"
 cp -a static "$INSTALL_DIR/static"
+printf '%s\n' "$VERSION" > "$INSTALL_DIR/VERSION"
 chown -R root:root "$INSTALL_DIR"
 
-echo "[6/8] Creating hardened systemd service..."
+install -m 0755 scripts/update-ubuntu.sh /usr/local/sbin/market-lab-update
+
+if [[ ! -s "$ENV_FILE" ]] || ! grep -q '^ADMIN_TOKEN=' "$ENV_FILE"; then
+  ADMIN_TOKEN="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
+  printf 'ADMIN_TOKEN=%s\n' "$ADMIN_TOKEN" > "$ENV_FILE"
+fi
+chown root:"$SERVICE_USER" "$ENV_FILE"
+chmod 0640 "$ENV_FILE"
+
+echo "[6/8] Creating hardened systemd services..."
 cat >"/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
 Description=Market Lab Realtime Crypto Market Research Engine
@@ -76,7 +88,7 @@ Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR
-
+EnvironmentFile=-$ENV_FILE
 Environment=PORT=$PORT
 Environment=DATA_DIR=$DATA_DIR
 Environment=DATABASE_URL=sqlite://$DATA_DIR/market.db
@@ -85,14 +97,12 @@ Environment=BINANCE_REST_BASE=https://api.binance.com
 Environment=BYBIT_WS_URL=wss://stream.bybit.com/v5/public/spot
 Environment=BYBIT_REST_BASE=https://api.bybit.com
 Environment=ANALYSIS_INTERVAL_SECS=30
-Environment=RISK_REWARD=3.0
+Environment=MAX_POSITION_SECS=3600
 Environment=RUST_LOG=market_lab=info,tower_http=info
-
 ExecStart=$INSTALL_DIR/market-lab
 Restart=always
 RestartSec=3
 TimeoutStopSec=20
-
 LimitNOFILE=1048576
 NoNewPrivileges=true
 PrivateTmp=true
@@ -104,12 +114,38 @@ ReadWritePaths=$DATA_DIR
 WantedBy=multi-user.target
 EOF
 
+cat >"/etc/systemd/system/market-lab-update.service" <<EOF
+[Unit]
+Description=Update Market Lab from GitHub
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=MARKET_LAB_BRANCH=$BRANCH
+Environment=MARKET_LAB_PORT=$PORT
+ExecStart=/usr/local/sbin/market-lab-update
+EOF
+
+cat >"/etc/systemd/system/market-lab-update.path" <<EOF
+[Unit]
+Description=Watch for Market Lab update requests
+
+[Path]
+PathExists=$REQUEST_FILE
+Unit=market-lab-update.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
+systemctl enable --now market-lab-update.path
 systemctl enable --now "$SERVICE_NAME"
 
 echo "[7/8] Waiting for health check..."
 HEALTH_OK=0
-for _ in $(seq 1 30); do
+for _ in $(seq 1 45); do
   if curl -fsS "http://127.0.0.1:$PORT/health" | grep -q '"ok":true'; then
     HEALTH_OK=1
     break
@@ -134,14 +170,19 @@ if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: 
 fi
 
 PRIMARY_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+ADMIN_TOKEN="$(sed -n 's/^ADMIN_TOKEN=//p' "$ENV_FILE")"
 echo
 echo "============================================================"
 echo " Market Lab installed successfully"
 echo "============================================================"
-echo " Service:   systemctl status $SERVICE_NAME"
-echo " Logs:      journalctl -u $SERVICE_NAME -f"
-echo " Data:      $DATA_DIR"
-echo " Binance:   http://${PRIMARY_IP:-SERVER_IP}:$PORT/binance"
-echo " Bybit:     http://${PRIMARY_IP:-SERVER_IP}:$PORT/bybit"
-echo " Health:    http://${PRIMARY_IP:-SERVER_IP}:$PORT/health"
+echo " Version:    $VERSION"
+echo " Service:    systemctl status $SERVICE_NAME"
+echo " Logs:       journalctl -u $SERVICE_NAME -f"
+echo " Update log: journalctl -u market-lab-update -f"
+echo " Data:       $DATA_DIR"
+echo " Binance:    http://${PRIMARY_IP:-SERVER_IP}:$PORT/binance"
+echo " Bybit:      http://${PRIMARY_IP:-SERVER_IP}:$PORT/bybit"
+echo " Health:     http://${PRIMARY_IP:-SERVER_IP}:$PORT/health"
+echo " Admin token for Clear Data / Update System:"
+echo " $ADMIN_TOKEN"
 echo "============================================================"
