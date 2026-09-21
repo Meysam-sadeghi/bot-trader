@@ -36,11 +36,14 @@ async fn main() -> anyhow::Result<()> {
     let analysis = AnalysisManager::new(db.clone());
     analysis.spawn_resolver();
 
+    let admin_token = std::env::var("ADMIN_TOKEN").unwrap_or_default();
+
     let state = AppState {
         db,
         capture,
         analysis,
         bus,
+        admin_token,
     };
 
     let app = api::router(state).layer(TraceLayer::new_for_http());
