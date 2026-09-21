@@ -7,21 +7,23 @@ A low-latency Rust service that captures live Spot market data from **Binance** 
 
 ## Ubuntu — one-command installation
 
-This is the recommended installation method for a **fresh Ubuntu server**. The repository is private, so the command first asks for a GitHub Personal Access Token without echoing it to the screen or putting the token itself in the command.
-
-For a fine-grained GitHub PAT, grant this repository **Contents: Read-only** access. A classic PAT can use the `repo` scope.
-
-Copy and paste this **single command**:
+The repository is public. On a fresh Ubuntu server, copy and paste this **single command**:
 
 ```bash
-bash -c 'set -Eeuo pipefail; read -rsp "GitHub PAT (read access to bot-trader): " GH_TOKEN; echo; export GH_TOKEN; URL="https://api.github.com/repos/Meysam-sadeghi/bot-trader/contents/scripts/install-ubuntu.sh?ref=mobile"; if [ "$(id -u)" -eq 0 ]; then curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw+json" "$URL" | bash; else curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw+json" "$URL" | sudo --preserve-env=GH_TOKEN bash; fi'
+curl -fsSL https://raw.githubusercontent.com/Meysam-sadeghi/bot-trader/mobile/scripts/install-ubuntu.sh | sudo bash
+```
+
+If you are already logged in as `root`, this also works:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Meysam-sadeghi/bot-trader/mobile/scripts/install-ubuntu.sh | bash
 ```
 
 The installer automatically:
 
 - updates Ubuntu packages and installs the required build dependencies
 - installs the current stable Rust toolchain
-- securely clones the private `mobile` branch
+- clones the public `mobile` branch
 - builds the optimized `--release` binary
 - installs the application under `/opt/market-lab`
 - creates the persistent data directory at `/var/lib/market-lab`
@@ -52,8 +54,6 @@ Market data and the SQLite database remain under:
 ```
 /var/lib/market-lab
 ```
-
-The installer does **not** store the GitHub PAT in the service configuration.
 
 ## Market data capture
 
