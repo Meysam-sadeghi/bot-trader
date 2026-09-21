@@ -8,8 +8,8 @@ DATA_DIR="/var/lib/market-lab"
 SERVICE_NAME="market-lab"
 SERVICE_USER="marketlab"
 PORT="${MARKET_LAB_PORT:-8080}"
-ENV_FILE="/etc/market-lab.env"
 REQUEST_FILE="$DATA_DIR/update.request"
+ENV_FILE="/etc/market-lab.env"
 TMP_DIR="$(mktemp -d)"
 
 cleanup() {
@@ -18,53 +18,70 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ "$(id -u)" -ne 0 ]]; then
-  echo "ERROR: installer must run as root."
-  echo "Use: curl -fsSL https://raw.githubusercontent.com/Meysam-sadeghi/bot-trader/mobile/scripts/install-ubuntu.sh | sudo bash"
+  echo "ERROR: updater must run as root."
   exit 1
 fi
 
-export DEBIAN_FRONTEND=noninteractive
-
-echo "[1/8] Installing Ubuntu dependencies..."
-apt-get update
-apt-get install -y --no-install-recommends \
-  build-essential \
-  ca-certificates \
-  curl \
-  git \
-  pkg-config \
-  libsqlite3-dev
-
-echo "[2/8] Installing/updating stable Rust..."
-if [[ ! -x /root/.cargo/bin/rustup ]]; then
-  curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+  echo "ERROR: $SERVICE_USER does not exist. Run the full installer first."
+  exit 1
 fi
-source /root/.cargo/env
+
+install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$DATA_DIR"
+
+RESUME_LINES=""
+if [[ -f "$REQUEST_FILE" ]]; then
+  RESUME_LINES="$(cat "$REQUEST_FILE" 2>/dev/null || true)"
+  rm -f "$REQUEST_FILE"
+fi
+
+# When invoked manually, preserve currently running capture sessions when possible.
+if [[ -z "$RESUME_LINES" ]]; then
+  for exchange in binance bybit; do
+    dashboard="$(curl -fsS "http://127.0.0.1:$PORT/api/dashboard/$exchange" 2>/dev/null || true)"
+    if [[ "$dashboard" == *'"running":true'* ]]; then
+      symbol="$(printf '%s' "$dashboard" | sed -n 's/.*"capture":{[^}]*"symbol":"\([^"]*\)".*/\1/p' | head -n1)"
+      if [[ "$symbol" =~ ^[A-Z0-9]{5,24}$ ]]; then
+        RESUME_LINES+="$exchange $symbol"$'\n'
+      fi
+    fi
+  done
+fi
+
+echo "[1/7] Preparing Rust toolchain..."
+if [[ -f /root/.cargo/env ]]; then
+  source /root/.cargo/env
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+  source /root/.cargo/env
+fi
 rustup toolchain install stable --profile minimal
 rustup default stable
-rustc --version
-cargo --version
 
-echo "[3/8] Downloading public repository..."
+echo "[2/7] Downloading latest $BRANCH from GitHub..."
 git clone --depth 1 --single-branch --branch "$BRANCH" \
   "https://github.com/$REPO.git" "$TMP_DIR/source"
 
-echo "[4/8] Building optimized release binary..."
+echo "[3/7] Building optimized release..."
 cd "$TMP_DIR/source"
 cargo build --release
-VERSION="$(git rev-parse HEAD)"
+NEW_VERSION="$(git rev-parse HEAD)"
 
-echo "[5/8] Installing application files..."
-if ! id "$SERVICE_USER" >/dev/null 2>&1; then
-  useradd --system --home-dir "$DATA_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
+echo "[4/7] Preparing rollback copy..."
+if [[ -x "$INSTALL_DIR/market-lab" ]]; then
+  cp -a "$INSTALL_DIR/market-lab" "$TMP_DIR/market-lab.previous"
+fi
+if [[ -d "$INSTALL_DIR/static" ]]; then
+  cp -a "$INSTALL_DIR/static" "$TMP_DIR/static.previous"
 fi
 
+echo "[5/7] Installing application and management units..."
 install -d -m 0755 "$INSTALL_DIR"
-install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$DATA_DIR"
 install -m 0755 target/release/market-lab "$INSTALL_DIR/market-lab"
 rm -rf "$INSTALL_DIR/static"
 cp -a static "$INSTALL_DIR/static"
-printf '%s\n' "$VERSION" > "$INSTALL_DIR/VERSION"
+printf '%s\n' "$NEW_VERSION" > "$INSTALL_DIR/VERSION"
 chown -R root:root "$INSTALL_DIR"
 
 install -m 0755 scripts/update-ubuntu.sh /usr/local/sbin/market-lab-update
@@ -76,7 +93,6 @@ fi
 chown root:"$SERVICE_USER" "$ENV_FILE"
 chmod 0640 "$ENV_FILE"
 
-echo "[6/8] Creating hardened systemd services..."
 cat >"/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
 Description=Market Lab Realtime Crypto Market Research Engine
@@ -141,9 +157,11 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now market-lab-update.path
-systemctl enable --now "$SERVICE_NAME"
 
-echo "[7/8] Waiting for health check..."
+echo "[6/7] Restarting Market Lab..."
+systemctl enable "$SERVICE_NAME" >/dev/null
+systemctl restart "$SERVICE_NAME"
+
 HEALTH_OK=0
 for _ in $(seq 1 45); do
   if curl -fsS "http://127.0.0.1:$PORT/health" | grep -q '"ok":true'; then
@@ -154,35 +172,29 @@ for _ in $(seq 1 45); do
 done
 
 if [[ "$HEALTH_OK" -ne 1 ]]; then
-  echo
-  echo "ERROR: service did not pass the health check."
-  echo "----- systemd status -----"
-  systemctl --no-pager --full status "$SERVICE_NAME" || true
-  echo "----- recent logs -----"
+  echo "ERROR: updated service failed health check; rolling back."
+  systemctl stop "$SERVICE_NAME" || true
+  if [[ -f "$TMP_DIR/market-lab.previous" ]]; then
+    install -m 0755 "$TMP_DIR/market-lab.previous" "$INSTALL_DIR/market-lab"
+  fi
+  if [[ -d "$TMP_DIR/static.previous" ]]; then
+    rm -rf "$INSTALL_DIR/static"
+    cp -a "$TMP_DIR/static.previous" "$INSTALL_DIR/static"
+  fi
+  systemctl restart "$SERVICE_NAME" || true
   journalctl -u "$SERVICE_NAME" -n 100 --no-pager || true
   exit 1
 fi
 
-echo "[8/8] Finalizing..."
-if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-  ufw allow "$PORT/tcp" >/dev/null
-  echo "UFW is active: opened TCP port $PORT."
-fi
+echo "[7/7] Restoring Auto Lab sessions..."
+while read -r exchange symbol; do
+  [[ -z "${exchange:-}" || -z "${symbol:-}" ]] && continue
+  if [[ "$exchange" =~ ^(binance|bybit)$ && "$symbol" =~ ^[A-Z0-9]{5,24}$ ]]; then
+    curl -fsS -X POST "http://127.0.0.1:$PORT/api/capture/$exchange/start?symbol=$symbol" >/dev/null || true
+  fi
+done <<< "$RESUME_LINES"
 
-PRIMARY_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-ADMIN_TOKEN="$(sed -n 's/^ADMIN_TOKEN=//p' "$ENV_FILE")"
 echo
-echo "============================================================"
-echo " Market Lab installed successfully"
-echo "============================================================"
-echo " Version:    $VERSION"
-echo " Service:    systemctl status $SERVICE_NAME"
-echo " Logs:       journalctl -u $SERVICE_NAME -f"
-echo " Update log: journalctl -u market-lab-update -f"
-echo " Data:       $DATA_DIR"
-echo " Binance:    http://${PRIMARY_IP:-SERVER_IP}:$PORT/binance"
-echo " Bybit:      http://${PRIMARY_IP:-SERVER_IP}:$PORT/bybit"
-echo " Health:     http://${PRIMARY_IP:-SERVER_IP}:$PORT/health"
-echo " Admin token for Clear Data / Update System:"
-echo " $ADMIN_TOKEN"
-echo "============================================================"
+echo "Market Lab update completed successfully."
+echo "Version: $NEW_VERSION"
+echo "Admin token: $(sed -n 's/^ADMIN_TOKEN=//p' "$ENV_FILE")"

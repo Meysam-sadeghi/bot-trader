@@ -18,15 +18,13 @@ pub struct AnalysisManager {
     tasks: Arc<RwLock<HashMap<Exchange, AbortHandle>>>,
     risk_reward: f64,
     interval_secs: u64,
+    max_position_secs: i64,
 }
 
 impl AnalysisManager {
     pub fn new(db: Database) -> Self {
-        let risk_reward = std::env::var("RISK_REWARD")
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| *value > 0.0)
-            .unwrap_or(3.0);
+        // Paper trades intentionally use a fixed 1:3 risk/reward ratio.
+        let risk_reward = 3.0;
 
         let interval_secs = std::env::var("ANALYSIS_INTERVAL_SECS")
             .ok()
@@ -34,11 +32,18 @@ impl AnalysisManager {
             .filter(|value| *value >= 5)
             .unwrap_or(30);
 
+        let max_position_secs = std::env::var("MAX_POSITION_SECS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(3_600)
+            .clamp(60, 3_600);
+
         Self {
             db,
             tasks: Arc::new(RwLock::new(HashMap::new())),
             risk_reward,
             interval_secs,
+            max_position_secs,
         }
     }
 
@@ -93,7 +98,7 @@ impl AnalysisManager {
         let now = now_ms();
         let points = self
             .db
-            .load_points(exchange, symbol, now - 2 * 60 * 60 * 1000, 150_000)
+            .load_points(exchange, symbol, now - 4 * 60 * 60 * 1000, 300_000)
             .await
             .context("load market history")?;
 
@@ -110,9 +115,18 @@ impl AnalysisManager {
             .context("no current price")?;
 
         let micro_score = microstructure_score(&current);
-        let horizons = [60_i64, 180_i64, 300_i64];
+        // One active paper position per horizon prevents uncontrolled position stacking.
+        // The 60-minute horizon is also the hard maximum holding time.
+        let horizons = [60_i64, 300_i64, 900_i64, 3_600_i64];
 
         for horizon_secs in horizons {
+            if self
+                .db
+                .has_open_prediction(exchange, symbol, horizon_secs)
+                .await?
+            {
+                continue;
+            }
             let horizon_steps = (horizon_secs / 5) as usize;
             let analog = pattern_forecast(&buckets, current_index, horizon_steps, &current);
 
@@ -187,7 +201,8 @@ impl AnalysisManager {
     async fn resolve_open_predictions(&self) -> anyhow::Result<()> {
         let now = now_ms();
         for prediction in self.db.open_predictions().await? {
-            let deadline = prediction.created_at + prediction.horizon_secs * 1000;
+            let hold_secs = prediction.horizon_secs.min(self.max_position_secs);
+            let deadline = prediction.created_at + hold_secs * 1000;
             let evaluation_end = now.min(deadline);
 
             if let Some((ts, price, won)) = self

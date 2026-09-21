@@ -11,7 +11,7 @@ use axum::{
         Path, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
@@ -26,6 +26,8 @@ pub struct AppState {
     pub capture: CaptureManager,
     pub analysis: AnalysisManager,
     pub bus: EventBus,
+    pub admin_token: String,
+    pub update_request_path: String,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -38,6 +40,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/capture/{exchange}/stop", post(stop_capture))
         .route("/api/analysis/{exchange}/start", post(start_analysis))
         .route("/api/analysis/{exchange}/stop", post(stop_analysis))
+        .route("/api/data/{exchange}/clear", post(clear_data))
+        .route("/api/system/update", post(update_system))
         .route("/api/dashboard/{exchange}", get(dashboard))
         .route("/api/predictions/{exchange}", get(predictions))
         .route("/ws/{exchange}", get(ws_upgrade))
@@ -65,13 +69,19 @@ async fn start_capture(
     Query(params): Query<StartParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let exchange = parse_exchange(&exchange)?;
-    let symbol = normalize_symbol(params.symbol.as_deref().unwrap_or("BTCUSDT"))?;
-    let started = state.capture.start(exchange, symbol.clone()).await;
+    let requested_symbol = normalize_symbol(params.symbol.as_deref().unwrap_or("BTCUSDT"))?;
+    let capture_started = state.capture.start(exchange, requested_symbol.clone()).await;
+
+    // Starting capture also starts the analysis/paper-trading loop automatically.
+    let active_symbol = state.capture.status(exchange).await.symbol;
+    let analysis_started = state.analysis.start(exchange, active_symbol.clone()).await;
 
     Ok(Json(json!({
-        "started": started,
+        "started": capture_started,
+        "analysis_started": analysis_started,
         "exchange": exchange,
-        "symbol": symbol
+        "symbol": active_symbol,
+        "automatic": true
     })))
 }
 
@@ -80,8 +90,13 @@ async fn stop_capture(
     Path(exchange): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let exchange = parse_exchange(&exchange)?;
-    let stopped = state.capture.stop(exchange).await;
-    Ok(Json(json!({"stopped": stopped, "exchange": exchange})))
+    let analysis_stopped = state.analysis.stop(exchange).await;
+    let capture_stopped = state.capture.stop(exchange).await;
+    Ok(Json(json!({
+        "stopped": capture_stopped,
+        "analysis_stopped": analysis_stopped,
+        "exchange": exchange
+    })))
 }
 
 async fn start_analysis(
@@ -109,6 +124,59 @@ async fn stop_analysis(
     let exchange = parse_exchange(&exchange)?;
     let stopped = state.analysis.stop(exchange).await;
     Ok(Json(json!({"stopped": stopped, "exchange": exchange})))
+}
+
+async fn clear_data(
+    State(state): State<AppState>,
+    Path(exchange): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let exchange = parse_exchange(&exchange)?;
+
+    // Stop producers first, then flush the database queue before deleting rows.
+    state.analysis.stop(exchange).await;
+    state.capture.stop(exchange).await;
+
+    let (events_deleted, predictions_deleted) = state
+        .db
+        .clear_exchange(exchange)
+        .await
+        .map_err(ApiError::internal)?;
+    state.capture.reset_status(exchange).await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "exchange": exchange,
+        "events_deleted": events_deleted,
+        "predictions_deleted": predictions_deleted
+    })))
+}
+
+async fn update_system(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+
+    let binance = state.capture.status(Exchange::Binance).await;
+    let bybit = state.capture.status(Exchange::Bybit).await;
+    let mut resume = String::new();
+    if binance.running {
+        resume.push_str(&format!("binance {}\n", binance.symbol));
+    }
+    if bybit.running {
+        resume.push_str(&format!("bybit {}\n", bybit.symbol));
+    }
+
+    tokio::fs::write(&state.update_request_path, resume)
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "message": "update queued; GitHub will be rebuilt and the service will restart automatically"
+    })))
 }
 
 async fn dashboard(
@@ -199,6 +267,29 @@ async fn ws_session(mut socket: WebSocket, bus: EventBus, exchange: Exchange) {
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    if state.admin_token.is_empty() {
+        return Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "admin actions are not configured on this server".to_string(),
+        });
+    }
+
+    let supplied = headers
+        .get("x-admin-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+
+    if supplied != state.admin_token {
+        return Err(ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "invalid admin token".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn parse_exchange(value: &str) -> Result<Exchange, ApiError> {

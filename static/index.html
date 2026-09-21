@@ -52,10 +52,17 @@
           <label for="symbol">Symbol</label>
           <input id="symbol" value="BTCUSDT" maxlength="24" autocomplete="off">
         </div>
-        <button id="start-capture" class="primary">Start Capture</button>
-        <button id="stop-capture">Stop Capture</button>
-        <button id="start-analysis" class="accent">Start Analysis</button>
-        <button id="stop-analysis">Stop Analysis</button>
+        <button id="start-capture" class="primary">Start Auto Lab</button>
+        <button id="stop-capture">Stop</button>
+        <button id="clear-data" class="danger">Clear Data</button>
+        <button id="update-system" class="accent">Update System</button>
+      </section>
+
+      <section class="automation-strip panel">
+        <strong>Automatic mode</strong>
+        <span>Capture → Analyze → Paper Trade</span>
+        <span>Risk : Reward = 1 : 3</span>
+        <span>Maximum hold = 60 minutes</span>
       </section>
 
       <section class="metrics-grid">
@@ -72,7 +79,7 @@
         <article class="metric panel">
           <span>Strict win rate</span>
           <strong id="win-rate">0.00%</strong>
-          <small id="resolved-count">0 resolved predictions</small>
+          <small id="resolved-count">0 resolved paper positions</small>
         </article>
         <article class="metric panel">
           <span>Average paper PnL</span>
@@ -99,7 +106,7 @@
           <div class="panel-heading">
             <div>
               <span class="eyebrow">MODEL OUTPUT</span>
-              <h2>Paper predictions</h2>
+              <h2>Automatic paper positions</h2>
             </div>
             <span id="prediction-total" class="badge">0 signals</span>
           </div>
@@ -119,7 +126,7 @@
                 </tr>
               </thead>
               <tbody id="prediction-body">
-                <tr><td colspan="9" class="empty">Start capture, then start analysis after enough history is collected.</td></tr>
+                <tr><td colspan="9" class="empty">Start Auto Lab. Analysis and paper trading begin automatically after enough history is captured.</td></tr>
               </tbody>
             </table>
           </div>
@@ -143,10 +150,11 @@
           <h2>Microstructure + historical analog matching</h2>
         </div>
         <p>
-          The engine combines taker buy/sell flow, best-book imbalance, short/long momentum,
-          spread and realized volatility. It then searches historical 5-second feature windows
-          for similar patterns and measures the forward return of the nearest analogs at
-          1, 3 and 5 minute horizons.
+          Start Auto Lab runs capture, analysis and simulated trading together. The engine combines
+          taker buy/sell flow, best-book imbalance, momentum, spread and realized volatility, then
+          compares the current 5-second feature state with historical analogs. Paper positions are
+          evaluated at 1, 5, 15 and 60 minute horizons, use a fixed 1:3 stop-loss/take-profit ratio,
+          and no simulated position is allowed to remain open longer than 60 minutes.
         </p>
       </section>
     </main>

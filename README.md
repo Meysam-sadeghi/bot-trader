@@ -29,6 +29,8 @@ The installer automatically:
 - creates the persistent data directory at `/var/lib/market-lab`
 - creates a dedicated unprivileged `marketlab` system user
 - creates and enables the `market-lab.service` systemd service
+- creates a protected root updater watched by `market-lab-update.path`
+- generates a persistent Admin Token for **Clear Data** and **Update System**
 - starts the service automatically and enables it after reboot
 - opens TCP port `8080` when UFW is already enabled
 - verifies `/health` before reporting a successful installation
@@ -55,9 +57,34 @@ Market data and the SQLite database remain under:
 /var/lib/market-lab
 ```
 
+
+## Update an existing Ubuntu installation
+
+Run this one command as root to pull the latest `mobile` branch, build it in release mode, install it, restart Market Lab and verify the health endpoint:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Meysam-sadeghi/bot-trader/mobile/scripts/update-ubuntu.sh | bash
+```
+
+The updater keeps the existing SQLite data, keeps the existing Admin Token, creates a rollback copy before replacing the running build, and restores the previous binary/UI if the new service fails its health check. When possible it also resumes Binance/Bybit Auto Lab sessions that were running before the update.
+
+After this upgrade, the **Update System** button performs the same update through a root-owned systemd path/service pair. The web process itself never receives sudo privileges.
+
+To display the Admin Token again on the server:
+
+```bash
+sudo sed -n 's/^ADMIN_TOKEN=//p' /etc/market-lab.env
+```
+
+Updater logs:
+
+```bash
+journalctl -u market-lab-update -f
+```
+
 ## Market data capture
 
-Each exchange has its own independent capture task, Start/Stop control, reconnect loop and status.
+Each exchange has its own independent capture task, Start/Stop control, reconnect loop and status. Pressing **Start Auto Lab** starts capture **and** the analysis/paper-trading engine together. Pressing Stop stops both.
 
 ### Binance Spot
 
@@ -114,13 +141,18 @@ Separate pages:
 Each page includes:
 
 - Symbol selection
-- Start Capture / Stop Capture
-- Start Analysis / Stop Analysis
+- Start Auto Lab / Stop
+- Automatic capture → analysis → simulated paper trading
+- Clear Data for the current exchange (Admin Token protected)
+- Update System from GitHub (Admin Token protected)
 - Live price chart
 - Live normalized event tape
 - Persisted event count
-- Paper prediction table
-- 1 / 3 / 5 minute horizons
+- Paper-position table
+- 1 / 5 / 15 / 60 minute horizons
+- Maximum one open paper position per horizon
+- Fixed 1:3 risk/reward on every simulated position
+- Hard maximum holding time of 60 minutes
 - Direction, confidence, entry, target and stop
 - WIN / LOSS / TIMEOUT resolution
 - Strict win rate
@@ -146,10 +178,11 @@ For every analysis iteration the engine:
 2. Scores immediate order-flow / momentum pressure.
 3. Searches historical windows for the closest feature patterns.
 4. Selects up to 30 nearest analogs.
-5. Measures actual forward returns after 1, 3 and 5 minutes for those analogs.
+5. Measures actual forward returns at 1, 5, 15 and 60 minute research horizons when enough historical context exists.
 6. Weights more similar analogs more heavily.
 7. Blends historical forward behavior with current microstructure.
-8. Creates immutable LONG/SHORT paper predictions.
+8. Opens LONG/SHORT paper positions automatically, with at most one open position per horizon.
+9. Sets take-profit exactly three times farther from entry than stop-loss.
 
 ## Forward-only evaluation
 
@@ -172,7 +205,7 @@ A separate resolver looks only at **subsequent** real trade events:
 
 - **WIN** — target is reached first
 - **LOSS** — stop is reached first
-- **TIMEOUT** — horizon expires before either level is reached
+- **TIMEOUT** — the horizon expires before either level is reached; no position can remain open beyond 60 minutes
 
 This prevents back-filled wins from contaminating the displayed win rate.
 
@@ -229,7 +262,11 @@ BYBIT_WS_URL=wss://stream.bybit.com/v5/public/spot
 BYBIT_REST_BASE=https://api.bybit.com
 
 ANALYSIS_INTERVAL_SECS=30
-RISK_REWARD=3.0
+MAX_POSITION_SECS=3600
+
+# Admin actions are disabled when this is empty.
+# Ubuntu installer generates this automatically in /etc/market-lab.env.
+# ADMIN_TOKEN=replace-with-a-long-random-secret
 ```
 
 Public testnet alternatives:
@@ -253,7 +290,7 @@ POST /api/capture/bybit/start?symbol=BTCUSDT
 POST /api/capture/bybit/stop
 ```
 
-Analysis:
+Analysis is automatically started/stopped by the Capture endpoints. Manual analysis endpoints remain available for compatibility:
 
 ```
 POST /api/analysis/binance/start?symbol=BTCUSDT
@@ -261,6 +298,16 @@ POST /api/analysis/binance/stop
 POST /api/analysis/bybit/start?symbol=BTCUSDT
 POST /api/analysis/bybit/stop
 ```
+
+Protected administration:
+
+```
+POST /api/data/binance/clear
+POST /api/data/bybit/clear
+POST /api/system/update
+```
+
+The protected routes require the `X-Admin-Token` header.
 
 Dashboard:
 
@@ -293,7 +340,7 @@ Bybit WS + REST snapshot ──┘             │
                                       microstructure + analog model
                                                     │
                                                     v
-                                          1m / 3m / 5m signals
+                                      1m / 5m / 15m / 60m positions
                                                     │
                                                     v
                                          forward outcome resolver
@@ -322,9 +369,11 @@ The current code establishes the complete capture → storage → analysis → p
 
 ## CI
 
-GitHub Actions runs:
+GitHub Actions validates both Ubuntu shell scripts and runs:
 
 ```bash
+bash -n scripts/install-ubuntu.sh
+bash -n scripts/update-ubuntu.sh
 cargo check --all-targets
 cargo test --all-targets
 ```
