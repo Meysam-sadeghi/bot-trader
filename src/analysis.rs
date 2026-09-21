@@ -1,6 +1,6 @@
 use crate::{
     db::Database,
-    model::{Exchange, MarketPoint, Prediction, now_ms},
+    model::{Exchange, MarketPoint, Prediction, now_ms, strategy_mode},
 };
 use anyhow::Context;
 use std::{
@@ -203,6 +203,7 @@ impl AnalysisManager {
                 confidence,
                 score: strategy_score,
                 expected_return: strategy_expected_return,
+                strategy: strategy_mode(exchange).to_string(),
                 status: "OPEN".to_string(),
                 resolved_at: None,
                 exit_price: None,
