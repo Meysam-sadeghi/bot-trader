@@ -138,6 +138,12 @@ impl CaptureManager {
         }
     }
 
+
+    pub async fn reset_status(&self, exchange: Exchange) {
+        let mut statuses = self.statuses.write().await;
+        statuses.insert(exchange, CaptureStatus::new(exchange));
+    }
+
     pub async fn status(&self, exchange: Exchange) -> CaptureStatus {
         self.statuses
             .read()
