@@ -13,6 +13,9 @@
 
   $("exchange-title").textContent = displayExchange;
   document.title = displayExchange + " Market Lab";
+  $("strategy-mode").textContent = exchange === "binance"
+    ? "Strategy: CONTRARIAN — model signal inverted"
+    : "Strategy: NORMAL — model signal followed";
   document.querySelectorAll(".nav-link").forEach((link) => {
     link.classList.toggle("active", link.dataset.exchange === exchange);
   });

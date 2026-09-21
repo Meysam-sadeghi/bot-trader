@@ -158,6 +158,16 @@ Each page includes:
 - Strict win rate
 - Average paper PnL in basis points
 
+## Strategy modes
+
+- **Binance: CONTRARIAN** — the analysis model runs normally, but every final paper-trade direction is inverted. A model LONG becomes a paper SHORT; a model SHORT becomes a paper LONG.
+- **Bybit: NORMAL** — follows the model direction without inversion.
+- Take-profit / stop-loss remains fixed at **3:1 reward:risk** after the direction is inverted.
+- The maximum paper-position holding time remains **60 minutes**.
+- Predictions are tagged with their strategy mode. Existing historical Binance predictions are preserved as `normal`; the Binance dashboard and Strict Win Rate now report the current `contrarian` strategy separately, so the experiment starts with clean statistics without deleting captured market history.
+
+This is an experiment on paper trades only. Inverting a historical win rate does not mathematically imply that the new win rate will equal `1 - old_win_rate`, because target/stop distances are asymmetric (3:1), timeouts exist, and path ordering determines whether TP or SL is reached first.
+
 ## Prediction engine
 
 The current model is a measurable baseline, not a claim of guaranteed prediction accuracy.

@@ -1,6 +1,6 @@
 use crate::{
     db::Database,
-    model::{Exchange, MarketPoint, Prediction, now_ms},
+    model::{Exchange, MarketPoint, Prediction, now_ms, strategy_mode},
 };
 use anyhow::Context;
 use std::{
@@ -146,15 +146,31 @@ impl AnalysisManager {
                 .unwrap_or(micro_prob_up)
                 .clamp(0.01, 0.99);
 
-            let direction = if expected_return >= 0.0 { "LONG" } else { "SHORT" };
-            let directional_probability = if direction == "LONG" {
+            let model_direction = if expected_return >= 0.0 { "LONG" } else { "SHORT" };
+            let model_directional_probability = if model_direction == "LONG" {
                 probability_up
             } else {
                 1.0 - probability_up
             };
-            let confidence = (0.75 * directional_probability
+            let confidence = (0.75 * model_directional_probability
                 + 0.25 * (0.5 + 0.5 * micro_score.abs()))
                 .clamp(0.50, 0.99);
+
+            // Binance intentionally runs a contrarian experiment:
+            // execute the exact opposite paper-trade direction from the model signal.
+            // Bybit remains unchanged as the control strategy.
+            let inverted = exchange == Exchange::Binance;
+            let direction = strategy_direction(exchange, model_direction);
+            let strategy_expected_return = if inverted {
+                -expected_return
+            } else {
+                expected_return
+            };
+            let strategy_score = if inverted {
+                -micro_score
+            } else {
+                micro_score
+            };
 
             let target_move = expected_return
                 .abs()
@@ -185,8 +201,9 @@ impl AnalysisManager {
                 target_price,
                 stop_price,
                 confidence,
-                score: micro_score,
-                expected_return,
+                score: strategy_score,
+                expected_return: strategy_expected_return,
+                strategy: strategy_mode(exchange).to_string(),
                 status: "OPEN".to_string(),
                 resolved_at: None,
                 exit_price: None,
@@ -497,6 +514,14 @@ fn standard_deviation(values: &[f64]) -> f64 {
     variance.sqrt()
 }
 
+fn strategy_direction(exchange: Exchange, model_direction: &'static str) -> &'static str {
+    if exchange == Exchange::Binance {
+        if model_direction == "LONG" { "SHORT" } else { "LONG" }
+    } else {
+        model_direction
+    }
+}
+
 fn paper_pnl_bps(prediction: &Prediction, exit_price: f64) -> f64 {
     if prediction.entry_price <= 0.0 {
         return 0.0;
@@ -511,12 +536,21 @@ fn paper_pnl_bps(prediction: &Prediction, exit_price: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::imbalance;
+    use super::{imbalance, strategy_direction};
+    use crate::model::Exchange;
 
     #[test]
     fn imbalance_is_bounded() {
         assert_eq!(imbalance(10.0, 0.0), 1.0);
         assert_eq!(imbalance(0.0, 10.0), -1.0);
         assert_eq!(imbalance(0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn binance_is_contrarian_but_bybit_is_normal() {
+        assert_eq!(strategy_direction(Exchange::Binance, "LONG"), "SHORT");
+        assert_eq!(strategy_direction(Exchange::Binance, "SHORT"), "LONG");
+        assert_eq!(strategy_direction(Exchange::Bybit, "LONG"), "LONG");
+        assert_eq!(strategy_direction(Exchange::Bybit, "SHORT"), "SHORT");
     }
 }

@@ -129,6 +129,7 @@ pub struct Prediction {
     pub confidence: f64,
     pub score: f64,
     pub expected_return: f64,
+    pub strategy: String,
     pub status: String,
     pub resolved_at: Option<i64>,
     pub exit_price: Option<f64>,
@@ -153,6 +154,13 @@ pub struct Dashboard {
     pub stored_events: i64,
     pub stats: PredictionStats,
     pub predictions: Vec<Prediction>,
+}
+
+pub fn strategy_mode(exchange: Exchange) -> &'static str {
+    match exchange {
+        Exchange::Binance => "contrarian",
+        Exchange::Bybit => "normal",
+    }
 }
 
 pub fn now_ms() -> i64 {
