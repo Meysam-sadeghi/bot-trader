@@ -157,9 +157,11 @@ pub struct Dashboard {
 }
 
 pub fn strategy_mode(exchange: Exchange) -> &'static str {
+    // Version strategy labels whenever the decision engine changes materially.
+    // This keeps forward V2 statistics separate from the older baseline.
     match exchange {
-        Exchange::Binance => "contrarian",
-        Exchange::Bybit => "normal",
+        Exchange::Binance => "contrarian_selective_v2",
+        Exchange::Bybit => "normal_selective_v2",
     }
 }
 
