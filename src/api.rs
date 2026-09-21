@@ -18,7 +18,6 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use std::{collections::HashMap, str::FromStr};
-use tokio::process::Command;
 use tower_http::{cors::CorsLayer, services::ServeDir};
 
 #[derive(Clone)]
@@ -28,6 +27,7 @@ pub struct AppState {
     pub analysis: AnalysisManager,
     pub bus: EventBus,
     pub admin_token: String,
+    pub update_request_path: String,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -159,30 +159,23 @@ async fn update_system(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state, &headers)?;
 
-    let output = Command::new("/usr/bin/sudo")
-        .args([
-            "-n",
-            "/usr/bin/systemctl",
-            "start",
-            "--no-block",
-            "market-lab-update.service",
-        ])
-        .output()
+    let binance = state.capture.status(Exchange::Binance).await;
+    let bybit = state.capture.status(Exchange::Bybit).await;
+    let mut resume = String::new();
+    if binance.running {
+        resume.push_str(&format!("binance {}\n", binance.symbol));
+    }
+    if bybit.running {
+        resume.push_str(&format!("bybit {}\n", bybit.symbol));
+    }
+
+    tokio::fs::write(&state.update_request_path, resume)
         .await
         .map_err(ApiError::internal)?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::error!(%stderr, "failed to start update service");
-        return Err(ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: "failed to start update service".to_string(),
-        });
-    }
-
     Ok(Json(json!({
         "ok": true,
-        "message": "update started; the service will restart automatically"
+        "message": "update queued; GitHub will be rebuilt and the service will restart automatically"
     })))
 }
 
