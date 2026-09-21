@@ -192,6 +192,22 @@ button {
 button:hover { border-color: #4b5d79; color: white; }
 button.primary { background: #163c31; border-color: #1d7357; color: #85f0c8; }
 button.accent { background: #192d4f; border-color: #2b5c9f; color: #9dc9ff; }
+button.danger { background: #3a171c; border-color: #71313a; color: #ff9aa7; }
+
+.automation-strip {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.automation-strip strong { color: var(--green); }
+.automation-strip span + span {
+  padding-left: 18px;
+  border-left: 1px solid var(--line);
+}
 
 .metrics-grid {
   display: grid;
@@ -340,6 +356,8 @@ td.empty { color: var(--muted); padding: 28px 8px; text-align: center; white-spa
 @media (max-width: 700px) {
   .sidebar { align-items: flex-start; flex-direction: column; gap: 10px; }
   .control-panel { align-items: stretch; flex-wrap: wrap; }
+  .automation-strip { align-items: flex-start; flex-direction: column; gap: 6px; }
+  .automation-strip span + span { padding-left: 0; border-left: 0; }
   .symbol-control { width: 100%; }
   input { width: 100%; }
   .metrics-grid { grid-template-columns: 1fr; }
