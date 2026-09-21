@@ -265,6 +265,7 @@ impl Database {
                           bid_price, bid_qty, ask_price, ask_qty
                    FROM market_events
                    WHERE exchange = ? AND symbol = ? AND received_ts >= ?
+                     AND kind IN ('trade', 'public_trade', 'book_ticker', 'kline')
                    ORDER BY received_ts DESC, id DESC
                    LIMIT ?
                ) recent
@@ -339,6 +340,30 @@ impl Database {
         .bind(symbol)
         .bind(horizon_secs)
         .bind(strategy_mode(exchange))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.try_get::<i64, _>("present")? != 0)
+    }
+
+    pub async fn has_recent_prediction(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        horizon_secs: i64,
+        since_ms: i64,
+    ) -> anyhow::Result<bool> {
+        let row = sqlx::query(
+            r#"SELECT EXISTS(
+                   SELECT 1 FROM predictions
+                   WHERE exchange = ? AND symbol = ? AND horizon_secs = ?
+                     AND strategy = ? AND created_at >= ?
+               ) AS present"#,
+        )
+        .bind(exchange.to_string())
+        .bind(symbol)
+        .bind(horizon_secs)
+        .bind(strategy_mode(exchange))
+        .bind(since_ms)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.try_get::<i64, _>("present")? != 0)
