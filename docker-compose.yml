@@ -1,0 +1,14 @@
+services:
+  market-lab:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      DATA_DIR: /app/data
+      DATABASE_URL: sqlite:///app/data/market.db
+      ANALYSIS_INTERVAL_SECS: "30"
+      RISK_REWARD: "3.0"
+    volumes:
+      - ./data:/app/data

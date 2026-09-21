@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - mobile
+      - feature/realtime-market-lab
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Cargo check
+        run: cargo check --all-targets
+      - name: Cargo test
+        run: cargo test --all-targets

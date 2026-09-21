@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Market Lab</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">ML</div>
+        <div>
+          <strong>Market Lab</strong>
+          <span>Realtime Research Engine</span>
+        </div>
+      </div>
+
+      <nav>
+        <a class="nav-link" data-exchange="binance" href="/binance">
+          <span class="exchange-dot binance"></span>
+          Binance
+        </a>
+        <a class="nav-link" data-exchange="bybit" href="/bybit">
+          <span class="exchange-dot bybit"></span>
+          Bybit
+        </a>
+      </nav>
+
+      <div class="sidebar-note">
+        <strong>Paper trading only</strong>
+        <span>No real orders are sent by this build.</span>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">SPOT MARKET INTELLIGENCE</div>
+          <h1><span id="exchange-title">Binance</span> / <span id="symbol-title">BTCUSDT</span></h1>
+        </div>
+        <div class="connection">
+          <span id="status-dot" class="status-dot"></span>
+          <span id="status-text">Stopped</span>
+        </div>
+      </header>
+
+      <section class="control-panel panel">
+        <div class="symbol-control">
+          <label for="symbol">Symbol</label>
+          <input id="symbol" value="BTCUSDT" maxlength="24" autocomplete="off">
+        </div>
+        <button id="start-capture" class="primary">Start Capture</button>
+        <button id="stop-capture">Stop Capture</button>
+        <button id="start-analysis" class="accent">Start Analysis</button>
+        <button id="stop-analysis">Stop Analysis</button>
+      </section>
+
+      <section class="metrics-grid">
+        <article class="metric panel">
+          <span>Last price</span>
+          <strong id="last-price">—</strong>
+          <small id="last-event">No events yet</small>
+        </article>
+        <article class="metric panel">
+          <span>Captured events</span>
+          <strong id="event-count">0</strong>
+          <small>Persisted to SQLite WAL</small>
+        </article>
+        <article class="metric panel">
+          <span>Strict win rate</span>
+          <strong id="win-rate">0.00%</strong>
+          <small id="resolved-count">0 resolved predictions</small>
+        </article>
+        <article class="metric panel">
+          <span>Average paper PnL</span>
+          <strong id="avg-pnl">0.00 bps</strong>
+          <small>Includes timeout exits</small>
+        </article>
+      </section>
+
+      <section class="chart-panel panel">
+        <div class="panel-heading">
+          <div>
+            <span class="eyebrow">LIVE MID / TRADE PRICE</span>
+            <h2>Realtime feed</h2>
+          </div>
+          <div id="analysis-badge" class="badge">Analysis stopped</div>
+        </div>
+        <svg id="price-chart" viewBox="0 0 1000 260" preserveAspectRatio="none" aria-label="Live price chart">
+          <polyline id="price-line" points="" fill="none" vector-effect="non-scaling-stroke"></polyline>
+        </svg>
+      </section>
+
+      <section class="two-column">
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <span class="eyebrow">MODEL OUTPUT</span>
+              <h2>Paper predictions</h2>
+            </div>
+            <span id="prediction-total" class="badge">0 signals</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Horizon</th>
+                  <th>Side</th>
+                  <th>Entry</th>
+                  <th>Target</th>
+                  <th>Stop</th>
+                  <th>Conf.</th>
+                  <th>Status</th>
+                  <th>PnL</th>
+                </tr>
+              </thead>
+              <tbody id="prediction-body">
+                <tr><td colspan="9" class="empty">Start capture, then start analysis after enough history is collected.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <span class="eyebrow">RAW NORMALIZED EVENTS</span>
+              <h2>Live event tape</h2>
+            </div>
+            <span id="live-rate" class="badge">0 msg/s</span>
+          </div>
+          <div class="event-tape" id="event-tape"></div>
+        </article>
+      </section>
+
+      <section class="panel explanation">
+        <div>
+          <span class="eyebrow">CURRENT MODEL</span>
+          <h2>Microstructure + historical analog matching</h2>
+        </div>
+        <p>
+          The engine combines taker buy/sell flow, best-book imbalance, short/long momentum,
+          spread and realized volatility. It then searches historical 5-second feature windows
+          for similar patterns and measures the forward return of the nearest analogs at
+          1, 3 and 5 minute horizons.
+        </p>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>
