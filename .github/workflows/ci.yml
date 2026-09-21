@@ -12,8 +12,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate Ubuntu installer
-        run: bash -n scripts/install-ubuntu.sh
+      - name: Validate Ubuntu scripts
+        run: |
+          bash -n scripts/install-ubuntu.sh
+          bash -n scripts/update-ubuntu.sh
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
