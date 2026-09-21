@@ -31,17 +31,27 @@ async fn connect_once(context: CaptureContext) -> anyhow::Result<()> {
         format!("{symbol}@trade"),
         format!("{symbol}@aggTrade"),
         format!("{symbol}@bookTicker"),
-        format!("{symbol}@depth20@100ms"),
+        format!("{symbol}@depth@100ms"),
         format!("{symbol}@kline_1s"),
     ]
     .join("/");
     let url = format!("{base}/stream?streams={streams}");
 
-    let (mut socket, _) = connect_async(&url)
+    let (mut socket, _) = connect_async(url.as_str())
         .await
         .with_context(|| format!("connect Binance websocket: {url}"))?;
 
-    tracing::info!(exchange = "binance", symbol = %context.symbol, "websocket connected");
+    // The WS connection is opened first so depth deltas can queue while the REST
+    // snapshot is fetched. The persisted snapshot lastUpdateId and each delta U/u
+    // are sufficient to replay Binance's documented synchronization procedure.
+    capture_snapshot(&context).await?;
+
+    tracing::info!(
+        exchange = "binance",
+        symbol = %context.symbol,
+        depth = "full-diff+5000-snapshot",
+        "websocket connected"
+    );
 
     while let Some(message) = socket.next().await {
         match message? {
@@ -66,6 +76,45 @@ async fn connect_once(context: CaptureContext) -> anyhow::Result<()> {
     }
 
     anyhow::bail!("Binance websocket disconnected")
+}
+
+async fn capture_snapshot(context: &CaptureContext) -> anyhow::Result<()> {
+    let rest_base = std::env::var("BINANCE_REST_BASE")
+        .unwrap_or_else(|_| "https://api.binance.com".to_string());
+    let url = format!(
+        "{rest_base}/api/v3/depth?symbol={}&limit=5000",
+        context.symbol
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .context("fetch Binance depth snapshot")?
+        .error_for_status()
+        .context("Binance depth snapshot HTTP error")?;
+    let data: Value = response.json().await?;
+    let ts = now_ms();
+
+    let event = MarketEvent {
+        exchange: Exchange::Binance,
+        symbol: context.symbol.clone(),
+        kind: "depth_snapshot".to_string(),
+        event_ts: ts,
+        received_ts: ts,
+        price: None,
+        qty: None,
+        side: None,
+        bid_price: nested_number(data.get("bids"), 0, 0),
+        bid_qty: nested_number(data.get("bids"), 0, 1),
+        ask_price: nested_number(data.get("asks"), 0, 0),
+        ask_qty: nested_number(data.get("asks"), 0, 1),
+        raw_json: data.to_string(),
+    };
+    context.emit(event).await
 }
 
 fn normalize(stream: &str, data: &Value, symbol: &str) -> Option<MarketEvent> {
