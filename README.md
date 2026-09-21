@@ -4,21 +4,30 @@ A low-latency Rust service that captures live Spot market data from **Binance** 
 
 > This build is intentionally **paper trading only**. It does not submit real orders and does not require exchange API keys for public market data.
 
-## What it captures
+## Market data capture
+
+Each exchange has its own independent capture task, Start/Stop control, reconnect loop and status.
 
 ### Binance Spot
 
-The collector uses a combined WebSocket connection for the selected symbol:
+The collector opens a combined public WebSocket for:
 
 - `trade` — individual trades
 - `aggTrade` — aggregate trades
 - `bookTicker` — best bid/ask and quantities
-- `depth20@100ms` — 20-level partial order-book snapshots
-- `kline_1s` — 1-second candlestick stream
+- `depth@100ms` — full incremental depth updates
+- `kline_1s` — 1-second kline stream
 
-Default public endpoint:
+Immediately after the WebSocket is open it also persists a REST depth snapshot with up to **5,000 levels per side**.
 
-`wss://stream.binance.com:9443`
+The raw snapshot includes `lastUpdateId`; subsequent diff-depth messages retain `U/u`. That means stored data can be replayed using Binance's official local-order-book synchronization algorithm rather than treating deltas as standalone snapshots.
+
+Default endpoints:
+
+```
+wss://stream.binance.com:9443
+https://api.binance.com
+```
 
 ### Bybit Spot
 
@@ -26,23 +35,32 @@ The collector subscribes to:
 
 - `publicTrade.{symbol}` — realtime public trades
 - `tickers.{symbol}` — last price + best bid/ask
-- `orderbook.200.{symbol}` — 200-level order book, 100ms
-- `kline.1.{symbol}` — 1-minute kline updates
+- `orderbook.full.{symbol}` — full-depth delta stream
+- `kline.1.{symbol}` — kline updates
 
-Default public endpoint:
+After subscribing it persists Bybit's REST **full depth snapshot**, which can contain up to **10,000 levels per side**.
 
-`wss://stream.bybit.com/v5/public/spot`
+Both the snapshot and full-depth deltas retain Bybit's `u` and `seq` fields in raw JSON so the local order book can be reconstructed with continuity validation.
 
-Each exchange has an independent capture task, reconnect/backoff logic and status.
+Default endpoints:
+
+```
+wss://stream.bybit.com/v5/public/spot
+https://api.bybit.com
+```
+
+### Storage warning
+
+Full-depth order books generate substantial data. Long-running capture, multiple symbols, and volatile markets can grow SQLite quickly. SQLite WAL is appropriate for this research build; large-scale archival should move raw depth events to ClickHouse or compressed Parquet while retaining the same normalized model.
 
 ## UI
 
-Two separate pages are available:
+Separate pages:
 
 - `/binance`
 - `/bybit`
 
-Each page provides:
+Each page includes:
 
 - Symbol selection
 - Start Capture / Stop Capture
@@ -50,19 +68,18 @@ Each page provides:
 - Live price chart
 - Live normalized event tape
 - Persisted event count
-- Paper-trade prediction table
-- 1 / 3 / 5 minute prediction horizons
-- Confidence score
-- Entry / target / stop
+- Paper prediction table
+- 1 / 3 / 5 minute horizons
+- Direction, confidence, entry, target and stop
 - WIN / LOSS / TIMEOUT resolution
 - Strict win rate
 - Average paper PnL in basis points
 
 ## Prediction engine
 
-This first research model deliberately avoids pretending that an LLM can predict price with certainty. It uses measurable microstructure features and validates every signal after it is issued.
+The current model is a measurable baseline, not a claim of guaranteed prediction accuracy.
 
-Market events are grouped into 5-second feature windows. Current features include:
+Events are aggregated into 5-second research windows. Features currently include:
 
 1. 15-second return
 2. 60-second return
@@ -72,29 +89,27 @@ Market events are grouped into 5-second feature windows. Current features includ
 6. Best-book bid/ask quantity imbalance
 7. Bid/ask spread in basis points
 
-The engine computes a microstructure score and then performs **historical analog matching**:
+For every analysis iteration the engine:
 
-1. Build the current feature vector.
-2. Search prior feature windows for the closest historical patterns.
-3. Select up to 30 nearest analogs.
-4. Measure what price did after 1, 3 and 5 minutes for those historical analogs.
-5. Weight closer analogs more heavily.
-6. Blend historical forward returns with the current microstructure score.
-7. Generate a LONG or SHORT paper prediction with confidence, target and stop.
+1. Builds the current microstructure feature vector.
+2. Scores immediate order-flow / momentum pressure.
+3. Searches historical windows for the closest feature patterns.
+4. Selects up to 30 nearest analogs.
+5. Measures actual forward returns after 1, 3 and 5 minutes for those analogs.
+6. Weights more similar analogs more heavily.
+7. Blends historical forward behavior with current microstructure.
+8. Creates immutable LONG/SHORT paper predictions.
 
-This is a strong baseline for later ML models because the generated dataset and evaluation loop remain usable when the prediction model changes.
+## Forward-only evaluation
 
-## Honest evaluation
+Predictions are written before their outcome is known.
 
-Predictions are immutable once created.
+Each prediction stores:
 
-For every prediction the system records:
-
-- creation timestamp
-- exchange
-- symbol
+- creation time
+- exchange and symbol
 - horizon
-- direction
+- LONG / SHORT
 - entry
 - target
 - stop
@@ -102,35 +117,28 @@ For every prediction the system records:
 - model score
 - expected return
 
-A background resolver then checks subsequent real trade prices:
+A separate resolver looks only at **subsequent** real trade events:
 
-- **WIN**: target is reached first
-- **LOSS**: stop is reached first
-- **TIMEOUT**: neither target nor stop is reached before the prediction horizon
+- **WIN** — target is reached first
+- **LOSS** — stop is reached first
+- **TIMEOUT** — horizon expires before either level is reached
 
-Win rate is therefore based on actual forward data, not back-filled predictions.
+This prevents back-filled wins from contaminating the displayed win rate.
 
 ## Persistence
 
-SQLite is configured in **WAL mode**.
+SQLite runs in **WAL mode**.
 
-Incoming events are sent through a bounded asynchronous channel and committed in batches instead of issuing one database transaction per WebSocket message.
-
-Stored columns include normalized fields for fast analysis plus the original raw JSON payload for later research/replay.
+A bounded async channel decouples market ingestion from disk I/O. Events are committed in batches rather than opening one transaction per WebSocket message.
 
 Important tables:
 
 - `market_events`
 - `predictions`
 
-For a much larger multi-symbol production deployment, the storage layer can later be replaced or supplemented with ClickHouse/Parquet while keeping the collector and model interfaces.
+Every market row contains normalized analysis fields plus the original raw JSON payload.
 
-## Run locally with Rust
-
-Requirements:
-
-- Current stable Rust toolchain
-- Internet access to Binance/Bybit public WebSocket endpoints
+## Run with Rust
 
 ```bash
 cp .env.example .env
@@ -139,16 +147,18 @@ cargo run --release
 
 Open:
 
-- http://localhost:8080/binance
-- http://localhost:8080/bybit
+```
+http://localhost:8080/binance
+http://localhost:8080/bybit
+```
 
-## Run with Docker
+## Docker
 
 ```bash
 docker compose up --build
 ```
 
-Market data is persisted under:
+Data is persisted under:
 
 ```
 ./data
@@ -162,42 +172,46 @@ DATA_DIR=data
 DATABASE_URL=sqlite://data/market.db
 
 BINANCE_WS_BASE=wss://stream.binance.com:9443
+BINANCE_REST_BASE=https://api.binance.com
+
 BYBIT_WS_URL=wss://stream.bybit.com/v5/public/spot
+BYBIT_REST_BASE=https://api.bybit.com
 
 ANALYSIS_INTERVAL_SECS=30
 RISK_REWARD=3.0
 ```
 
-To use public testnet streams:
+Public testnet alternatives:
 
 ```env
 BINANCE_WS_BASE=wss://stream.testnet.binance.vision:9443
+BINANCE_REST_BASE=https://testnet.binance.vision
+
 BYBIT_WS_URL=wss://stream-testnet.bybit.com/v5/public/spot
+BYBIT_REST_BASE=https://api-testnet.bybit.com
 ```
 
 ## API
 
-### Capture
+Capture:
 
 ```
 POST /api/capture/binance/start?symbol=BTCUSDT
 POST /api/capture/binance/stop
-
 POST /api/capture/bybit/start?symbol=BTCUSDT
 POST /api/capture/bybit/stop
 ```
 
-### Analysis
+Analysis:
 
 ```
 POST /api/analysis/binance/start?symbol=BTCUSDT
 POST /api/analysis/binance/stop
-
 POST /api/analysis/bybit/start?symbol=BTCUSDT
 POST /api/analysis/bybit/stop
 ```
 
-### Dashboard
+Dashboard:
 
 ```
 GET /api/dashboard/binance
@@ -206,7 +220,7 @@ GET /api/predictions/binance
 GET /api/predictions/bybit
 ```
 
-### Live browser stream
+Browser realtime stream:
 
 ```
 GET /ws/binance
@@ -216,46 +230,44 @@ GET /ws/bybit
 ## Architecture
 
 ```
-Binance WS ─┐
-            ├──> Rust async collectors ──> normalized event bus ──> browser WebSocket
-Bybit WS ───┘              │
-                           └──> batched SQLite WAL writer
-                                      │
-                                      v
-                              feature aggregation
-                                      │
-                                      v
-                         historical analog matcher
-                                      │
-                                      v
-                            paper predictions
-                                      │
-                                      v
-                          forward outcome resolver
-                                      │
-                                      v
-                         win rate + paper PnL
+Binance WS + REST snapshot ─┐
+                           ├──> Rust async collectors ──> browser live event bus
+Bybit WS + REST snapshot ──┘             │
+                                         └──> batched SQLite WAL
+                                                    │
+                                                    v
+                                            5s feature windows
+                                                    │
+                                                    v
+                                      microstructure + analog model
+                                                    │
+                                                    v
+                                          1m / 3m / 5m signals
+                                                    │
+                                                    v
+                                         forward outcome resolver
+                                                    │
+                                                    v
+                                         win rate + paper PnL
 ```
 
-## Current scope and next upgrades
+## Next research upgrades
 
-This branch establishes the full capture → storage → analysis → prediction → forward-validation loop.
+The current code establishes the complete capture → storage → analysis → prediction → validation loop. High-value next work:
 
-High-value next upgrades:
-
-- Sequence-validated full local order book reconstruction
-- Multi-symbol capture
-- Cross-exchange lead/lag features
-- Order-book slope and depth imbalance at multiple distances
-- Trade intensity / inter-arrival time
-- CVD and volume-profile features
-- Regime detection
-- Walk-forward train/validation separation
-- XGBoost/LightGBM or neural sequence model trained from exported feature windows
-- ClickHouse or Parquet archival for long retention
-- Prometheus metrics and capture-gap alarms
-- Replay/backtest service using the exact same event model
-- Optional authenticated testnet execution only after paper results justify it
+- In-memory sequence-validated local order book state for both exchanges
+- Cross-exchange Binance/Bybit lead-lag features
+- Multi-level depth imbalance (1/5/10/25/50 bps)
+- Order-book slope, replenishment and cancellation pressure
+- CVD, trade intensity and inter-arrival time
+- Spoof-resistance / fleeting-liquidity features
+- Market regime detection
+- Walk-forward training and validation partitions
+- Replay/backtest using the exact same event structures
+- XGBoost/LightGBM or sequence model trained from exported features
+- ClickHouse / Parquet archival
+- Prometheus capture-gap and latency metrics
+- Optional authenticated **testnet** execution only after paper results demonstrate stable out-of-sample performance
 
 ## CI
 
@@ -266,4 +278,4 @@ cargo check --all-targets
 cargo test --all-targets
 ```
 
-on the feature branch and pull requests.
+on feature branches and pull requests.
