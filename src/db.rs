@@ -1,4 +1,4 @@
-use crate::model::{Exchange, MarketEvent, MarketPoint, Prediction, PredictionStats};
+use crate::model::{strategy_mode, Exchange, MarketEvent, MarketPoint, Prediction, PredictionStats};
 use anyhow::Context;
 use sqlx::{
     Row, SqlitePool,
@@ -75,6 +75,7 @@ impl Database {
                 confidence REAL NOT NULL,
                 score REAL NOT NULL,
                 expected_return REAL NOT NULL,
+                strategy TEXT NOT NULL DEFAULT 'normal',
                 status TEXT NOT NULL DEFAULT 'OPEN',
                 resolved_at INTEGER,
                 exit_price REAL,
@@ -89,6 +90,30 @@ impl Database {
         for statement in statements {
             sqlx::query(statement).execute(pool).await?;
         }
+
+        // Existing databases predate strategy tracking. Preserve all historical
+        // rows as "normal" and separate new Binance contrarian statistics.
+        let columns = sqlx::query("PRAGMA table_info(predictions)")
+            .fetch_all(pool)
+            .await?;
+        let has_strategy = columns.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .map(|name| name == "strategy")
+                .unwrap_or(false)
+        });
+        if !has_strategy {
+            sqlx::query(
+                "ALTER TABLE predictions ADD COLUMN strategy TEXT NOT NULL DEFAULT 'normal'",
+            )
+            .execute(pool)
+            .await?;
+        }
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_predictions_strategy ON predictions(exchange, symbol, strategy, created_at)",
+        )
+        .execute(pool)
+        .await?;
+
         Ok(())
     }
 
@@ -275,8 +300,8 @@ impl Database {
             r#"INSERT INTO predictions (
                 id, exchange, symbol, created_at, horizon_secs, direction,
                 entry_price, target_price, stop_price, confidence, score,
-                expected_return, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                expected_return, strategy, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&prediction.id)
         .bind(prediction.exchange.to_string())
@@ -290,6 +315,7 @@ impl Database {
         .bind(prediction.confidence)
         .bind(prediction.score)
         .bind(prediction.expected_return)
+        .bind(&prediction.strategy)
         .bind(&prediction.status)
         .execute(&self.pool)
         .await?;
@@ -305,12 +331,14 @@ impl Database {
         let row = sqlx::query(
             r#"SELECT EXISTS(
                    SELECT 1 FROM predictions
-                   WHERE exchange = ? AND symbol = ? AND horizon_secs = ? AND status = 'OPEN'
+                   WHERE exchange = ? AND symbol = ? AND horizon_secs = ?
+                     AND strategy = ? AND status = 'OPEN'
                ) AS present"#,
         )
         .bind(exchange.to_string())
         .bind(symbol)
         .bind(horizon_secs)
+        .bind(strategy_mode(exchange))
         .fetch_one(&self.pool)
         .await?;
         Ok(row.try_get::<i64, _>("present")? != 0)
@@ -333,11 +361,12 @@ impl Database {
     ) -> anyhow::Result<Vec<Prediction>> {
         let rows = sqlx::query(
             r#"SELECT * FROM predictions
-               WHERE exchange = ? AND symbol = ?
+               WHERE exchange = ? AND symbol = ? AND strategy = ?
                ORDER BY created_at DESC LIMIT ?"#,
         )
         .bind(exchange.to_string())
         .bind(symbol)
+        .bind(strategy_mode(exchange))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -358,10 +387,11 @@ impl Database {
                 SUM(CASE WHEN status = 'TIMEOUT' THEN 1 ELSE 0 END) AS timeouts,
                 AVG(CASE WHEN status != 'OPEN' THEN pnl_bps END) AS avg_pnl_bps
                FROM predictions
-               WHERE exchange = ? AND symbol = ?"#,
+               WHERE exchange = ? AND symbol = ? AND strategy = ?"#,
         )
         .bind(exchange.to_string())
         .bind(symbol)
+        .bind(strategy_mode(exchange))
         .fetch_one(&self.pool)
         .await?;
 
@@ -494,6 +524,7 @@ fn row_to_prediction(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Prediction>
         confidence: row.try_get("confidence")?,
         score: row.try_get("score")?,
         expected_return: row.try_get("expected_return")?,
+        strategy: row.try_get("strategy")?,
         status: row.try_get("status")?,
         resolved_at: row.try_get("resolved_at")?,
         exit_price: row.try_get("exit_price")?,
