@@ -44,16 +44,10 @@
     try {
       if (name === "capture-start") {
         await request("/api/capture/" + exchange + "/start?symbol=" + encoded, { method: "POST" });
-        toast(displayExchange + " capture started");
+        toast(displayExchange + " Auto Lab started: capture + analysis + paper trading");
       } else if (name === "capture-stop") {
         await request("/api/capture/" + exchange + "/stop", { method: "POST" });
-        toast(displayExchange + " capture stopped");
-      } else if (name === "analysis-start") {
-        await request("/api/analysis/" + exchange + "/start?symbol=" + encoded, { method: "POST" });
-        toast("Analysis engine started");
-      } else if (name === "analysis-stop") {
-        await request("/api/analysis/" + exchange + "/stop", { method: "POST" });
-        toast("Analysis engine stopped");
+        toast(displayExchange + " Auto Lab stopped");
       }
       await refresh();
     } catch (error) {
@@ -63,8 +57,61 @@
 
   $("start-capture").addEventListener("click", () => action("capture-start"));
   $("stop-capture").addEventListener("click", () => action("capture-stop"));
-  $("start-analysis").addEventListener("click", () => action("analysis-start"));
-  $("stop-analysis").addEventListener("click", () => action("analysis-stop"));
+
+  function getAdminToken() {
+    let token = sessionStorage.getItem("marketLabAdminToken") || "";
+    if (!token) {
+      token = window.prompt("Admin token (shown by the Ubuntu installer):") || "";
+      if (token) sessionStorage.setItem("marketLabAdminToken", token);
+    }
+    return token;
+  }
+
+  async function adminRequest(path) {
+    const token = getAdminToken();
+    if (!token) throw new Error("Admin token is required");
+    try {
+      return await request(path, {
+        method: "POST",
+        headers: { "X-Admin-Token": token }
+      });
+    } catch (error) {
+      if (error.message.toLowerCase().includes("admin token")) {
+        sessionStorage.removeItem("marketLabAdminToken");
+      }
+      throw error;
+    }
+  }
+
+  $("clear-data").addEventListener("click", async () => {
+    if (!window.confirm("Stop Auto Lab and permanently clear all captured data and paper positions for " + displayExchange + "?")) {
+      return;
+    }
+    try {
+      const result = await adminRequest("/api/data/" + exchange + "/clear");
+      pricePoints.length = 0;
+      liveEvents.length = 0;
+      $("event-tape").innerHTML = "";
+      renderChart();
+      toast("Cleared " + Number(result.events_deleted || 0).toLocaleString() + " events and " +
+        Number(result.predictions_deleted || 0).toLocaleString() + " paper positions");
+      await refresh();
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+
+  $("update-system").addEventListener("click", async () => {
+    if (!window.confirm("Update Market Lab from the latest mobile branch on GitHub? The service will restart automatically.")) {
+      return;
+    }
+    try {
+      await adminRequest("/api/system/update");
+      toast("Update started. Market Lab will rebuild and restart automatically.");
+    } catch (error) {
+      toast(error.message);
+    }
+  });
 
   function formatPrice(value) {
     if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
@@ -92,7 +139,7 @@
     $("prediction-total").textContent = items.length + " signals";
     const body = $("prediction-body");
     if (!items.length) {
-      body.innerHTML = '<tr><td colspan="9" class="empty">No predictions yet. Capture enough market history, then start analysis.</td></tr>';
+      body.innerHTML = '<tr><td colspan="9" class="empty">No paper positions yet. Auto analysis starts with capture and opens positions after enough history is available.</td></tr>';
       return;
     }
 
@@ -183,11 +230,11 @@
 
       const stats = data.stats || {};
       $("win-rate").textContent = ((Number(stats.win_rate) || 0) * 100).toFixed(2) + "%";
-      $("resolved-count").textContent = (stats.resolved || 0) + " resolved predictions";
+      $("resolved-count").textContent = (stats.resolved || 0) + " resolved paper positions";
       const avg = Number(stats.avg_pnl_bps) || 0;
       $("avg-pnl").textContent = (avg >= 0 ? "+" : "") + avg.toFixed(2) + " bps";
 
-      $("analysis-badge").textContent = data.analysis_running ? "Analysis running" : "Analysis stopped";
+      $("analysis-badge").textContent = data.analysis_running ? "Auto analysis running" : "Auto analysis stopped";
       $("analysis-badge").classList.toggle("active", !!data.analysis_running);
 
       renderPredictions(data.predictions || []);
