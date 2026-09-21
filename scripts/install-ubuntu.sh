@@ -11,18 +11,13 @@ PORT="${MARKET_LAB_PORT:-8080}"
 TMP_DIR="$(mktemp -d)"
 
 cleanup() {
-  unset GH_TOKEN AUTH_HEADER || true
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
 
 if [[ "$(id -u)" -ne 0 ]]; then
-  echo "ERROR: installer must run as root. Use the README one-command installer."
-  exit 1
-fi
-
-if [[ -z "${GH_TOKEN:-}" ]]; then
-  echo "ERROR: GH_TOKEN is required because the repository is private."
+  echo "ERROR: installer must run as root."
+  echo "Use: curl -fsSL https://raw.githubusercontent.com/Meysam-sadeghi/bot-trader/mobile/scripts/install-ubuntu.sh | sudo bash"
   exit 1
 fi
 
@@ -48,12 +43,9 @@ rustup default stable
 rustc --version
 cargo --version
 
-echo "[3/8] Downloading private repository..."
-AUTH_HEADER="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-git -c http.extraHeader="Authorization: Basic $AUTH_HEADER" \
-  clone --depth 1 --single-branch --branch "$BRANCH" \
+echo "[3/8] Downloading public repository..."
+git clone --depth 1 --single-branch --branch "$BRANCH" \
   "https://github.com/$REPO.git" "$TMP_DIR/source"
-unset AUTH_HEADER GH_TOKEN
 
 echo "[4/8] Building optimized release binary..."
 cd "$TMP_DIR/source"
