@@ -160,39 +160,48 @@ Each page includes:
 
 ## Strategy modes
 
-- **Binance: CONTRARIAN** — the analysis model runs normally, but every final paper-trade direction is inverted. A model LONG becomes a paper SHORT; a model SHORT becomes a paper LONG.
-- **Bybit: NORMAL** — follows the model direction without inversion.
+- **Binance: CONTRARIAN Selective V2** — every accepted model direction is still inverted, but weak/noisy setups are rejected before a paper trade is created.
+- **Bybit: NORMAL Selective V2** — follows the accepted model direction without inversion.
 - Take-profit / stop-loss remains fixed at **3:1 reward:risk** after the direction is inverted.
 - The maximum paper-position holding time remains **60 minutes**.
 - Predictions are tagged with their strategy mode. Existing historical Binance predictions are preserved as `normal`; the Binance dashboard and Strict Win Rate now report the current `contrarian` strategy separately, so the experiment starts with clean statistics without deleting captured market history.
 
 This is an experiment on paper trades only. Inverting a historical win rate does not mathematically imply that the new win rate will equal `1 - old_win_rate`, because target/stop distances are asymmetric (3:1), timeouts exist, and path ordering determines whether TP or SL is reached first.
 
-## Prediction engine
+## Prediction engine — Selective Signal V2
 
-The current model is a measurable baseline, not a claim of guaranteed prediction accuracy.
+V2 is designed to improve **forward selectivity**, not to manufacture a backtest win rate. The default research gate asks for an 80% weighted strict win rate among similar historical analogs, but **80% is a target threshold, not a guarantee of future performance**. If the evidence is weak, the correct action is NO TRADE.
 
-Events are aggregated into 5-second research windows. Features currently include:
+Events are aggregated into continuous 5-second research windows. Missing windows are filled so 1/5/15/60-minute horizons remain clock-time accurate. Features now include:
 
-1. 15-second return
-2. 60-second return
-3. 15-second taker buy/sell flow imbalance
-4. 60-second taker buy/sell flow imbalance
-5. Realized short-term volatility
-6. Best-book bid/ask quantity imbalance
-7. Bid/ask spread in basis points
+1. 15-second, 60-second and 5-minute log returns
+2. Momentum acceleration
+3. 15-second, 60-second and 5-minute taker-flow imbalance
+4. 60-second and 5-minute realized volatility
+5. Current and persistent top-book imbalance
+6. Bid/ask spread in basis points
+7. Relative traded volume
+8. Relative trade intensity
+9. 5-minute trend efficiency
+10. Position inside the recent 5-minute range
+11. Optional cross-exchange Binance/Bybit microstructure confirmation
 
 For every analysis iteration the engine:
 
-1. Builds the current microstructure feature vector.
-2. Scores immediate order-flow / momentum pressure.
-3. Searches historical windows for the closest feature patterns.
-4. Selects up to 30 nearest analogs.
-5. Measures actual forward returns at 1, 5, 15 and 60 minute research horizons when enough historical context exists.
-6. Weights more similar analogs more heavily.
-7. Blends historical forward behavior with current microstructure.
-8. Opens LONG/SHORT paper positions automatically, with at most one open position per horizon.
-9. Sets take-profit exactly three times farther from entry than stop-loss.
+1. Builds the enriched microstructure feature vector.
+2. Searches a configurable longer history for similar states.
+3. De-correlates neighboring analogs in time so adjacent 5-second samples are not treated as independent evidence.
+4. Estimates forward return and direction probability from the nearest analogs.
+5. Builds the same fixed 1:3 TP/SL geometry used by the paper trade.
+6. Replays each historical analog forward and measures **which barrier was hit first**: TP, SL, or timeout.
+7. Treats an ambiguous bucket that touched both TP and SL as a loss, avoiding optimistic backtest bias.
+8. Computes weighted strict win probability plus a Wilson lower confidence bound.
+9. Applies spread, edge, confidence, minimum-sample and re-entry cooldown gates.
+10. Opens a paper position only when all gates pass; otherwise it records no forced trade.
+
+Binance still uses the requested CONTRARIAN direction rule, but V2 only permits the inverted trade when historical barrier evidence supports it. Bybit remains NORMAL.
+
+A useful statistical reference: with a symmetric random walk and a take-profit three times farther away than the stop, the theoretical TP-before-SL probability is about 25%. Therefore a 25–30% win rate with 3:1 reward:risk is not automatically a losing system; expectancy, timeouts, fees and slippage matter as much as raw win rate.
 
 ## Forward-only evaluation
 
@@ -273,6 +282,20 @@ BYBIT_REST_BASE=https://api.bybit.com
 
 ANALYSIS_INTERVAL_SECS=30
 MAX_POSITION_SECS=3600
+
+# Selective Signal Engine V2.
+# TARGET_STRICT_WIN_RATE is a historical analog admission threshold,
+# not a promise that forward results will equal this percentage.
+ANALYSIS_LOOKBACK_HOURS=24
+ANALYSIS_MAX_POINTS=750000
+TARGET_STRICT_WIN_RATE=0.80
+MIN_SIGNAL_CONFIDENCE=0.72
+MIN_WIN_LOWER_BOUND=0.55
+MIN_SIGNAL_EDGE_BPS=2.0
+MAX_SPREAD_BPS=3.0
+MIN_ANALOG_SAMPLES=24
+ANALOG_NEIGHBORS=80
+REENTRY_COOLDOWN_SECS=180
 
 # Admin actions are disabled when this is empty.
 # Ubuntu installer generates this automatically in /etc/market-lab.env.
