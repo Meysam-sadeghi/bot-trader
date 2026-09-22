@@ -139,6 +139,7 @@ pub struct PositionDiagnosis {
     pub held_ms: Option<i64>,
     pub target_net_bps: Option<f64>,
     pub stop_net_bps_at_level: Option<f64>,
+    pub planned_net_reward_risk: Option<f64>,
     pub best_observed_net_bps: Option<f64>,
     pub worst_observed_net_bps: Option<f64>,
     pub gave_back_observed_profit: bool,
@@ -202,6 +203,13 @@ pub fn diagnose(p: &Prediction) -> PositionDiagnosis {
             .then(|| paper::pnl(&p.direction, p.entry_price, p.target_price, p.fee_bps).1),
         stop_net_bps_at_level: (p.config_id != "legacy")
             .then(|| paper::pnl(&p.direction, p.entry_price, p.stop_price, p.fee_bps).1),
+        planned_net_reward_risk: (p.config_id != "legacy")
+            .then(|| {
+                let target = paper::pnl(&p.direction, p.entry_price, p.target_price, p.fee_bps).1;
+                let stop = paper::pnl(&p.direction, p.entry_price, p.stop_price, p.fee_bps).1;
+                (stop < 0.).then_some(target / -stop)
+            })
+            .flatten(),
         best_observed_net_bps: best,
         worst_observed_net_bps: worst,
         gave_back_observed_profit: net.is_some_and(|v| v < 0.) && best.is_some_and(|v| v > 0.),

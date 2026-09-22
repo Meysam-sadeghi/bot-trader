@@ -17,7 +17,7 @@ pub fn prediction() -> Prediction {
         confidence: 0.,
         score: 0.5,
         expected_return: 0.,
-        strategy: "flow_follow_v3".into(),
+        strategy: "flow_follow_v4".into(),
         status: "OPEN".into(),
         resolved_at: None,
         exit_price: None,

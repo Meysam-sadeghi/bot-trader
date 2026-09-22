@@ -175,7 +175,10 @@
       const facts = [["Position", p.exchange + ' · ' + p.symbol + ' · ' + p.strategy + ' · ' + p.direction],
         ["Entry time", new Date(p.created_at).toLocaleString()], ["Entry reason", p.entry_reason],
         ["Exit", d.exit_reason + ' (' + d.exit_reason_source + ')'], ["Net result", bps(p.pnl_bps)],
-        ["Modeled fees paid", bps(d.fees_paid_bps)], ["Best observed net mark", bps(d.best_observed_net_bps)],
+        ["Modeled fees paid", bps(d.fees_paid_bps)],
+        ["Planned target net", bps(d.target_net_bps)], ["Planned stop net", bps(d.stop_net_bps_at_level)],
+        ["Planned net reward / risk", d.planned_net_reward_risk == null ? 'Not recorded' : Number(d.planned_net_reward_risk).toFixed(2) + ' ×'],
+        ["Best observed net mark", bps(d.best_observed_net_bps)],
         ["Worst observed net mark", bps(d.worst_observed_net_bps)], ["Entry evidence", d.entry_evidence], ["Path coverage", d.path_evidence]];
       $("position-detail").innerHTML = '<div class="evidence-facts">' + facts.map(([label,value]) => '<p><span>' + label + '</span>' + escapeHtml(value) + '</p>').join('') + '</div>' +
         '<p class="research-note">' + (p.entry_snapshot ? 'Entry values were stored when the signal was accepted. Scores are not win probabilities.' : 'This position predates detailed entry recording. Its missing conditions cannot be recovered from its final result.') + '</p>' +
@@ -322,7 +325,7 @@
         : (item.pnl_bps >= 0 ? "+" : "") + Number(item.pnl_bps).toFixed(2);
       return "<tr>" +
         "<td>" + formatTime(item.created_at) + "</td>" +
-        "<td title=\"" + escapeHtml(item.entry_reason) + "\">" + escapeHtml(item.strategy.replace("_v3", "")) + "</td>" +
+        "<td title=\"" + escapeHtml(item.entry_reason) + "\">" + escapeHtml(item.strategy.replace(/_v[34]$/, "")) + "</td>" +
         "<td>" + Math.round(item.horizon_secs / 60) + "m</td>" +
         '<td class="' + sideClass + '">' + item.direction + "</td>" +
         "<td>" + formatPrice(item.entry_price) + "</td>" +

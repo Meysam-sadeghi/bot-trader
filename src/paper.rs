@@ -5,32 +5,32 @@ use serde::Serialize;
 pub const HORIZONS: [i64; 4] = [60, 300, 900, 3600];
 pub const STRATEGIES: [(&str, &str, &str); 6] = [
     (
-        "flow_follow_v3",
+        "flow_follow_v4",
         "Order-flow follow",
         "Follows aligned taker flow, book pressure and short momentum.",
     ),
     (
-        "flow_reverse_v3",
+        "flow_reverse_v4",
         "Order-flow reverse",
         "Opposite-direction control using the same flow setup.",
     ),
     (
-        "trend_pullback_v3",
+        "trend_pullback_v4",
         "Trend pullback",
         "Joins an efficient trend after a short pullback begins to recover.",
     ),
     (
-        "breakout_v3",
+        "breakout_v4",
         "Confirmed breakout",
         "Requires a five-minute breakout, volume expansion and aligned flow.",
     ),
     (
-        "range_reversion_v3",
+        "range_reversion_v4",
         "Range reversion",
         "Fades range extremes only after flow and acceleration turn inward.",
     ),
     (
-        "consensus_v3",
+        "consensus_v4",
         "Selective consensus",
         "Requires fresh peer agreement and cost-aware, non-overlapping historical analog evidence.",
     ),
@@ -40,6 +40,8 @@ pub const STRATEGIES: [(&str, &str, &str); 6] = [
 pub struct LabConfig {
     pub engine_version: u32,
     pub risk_reward: f64,
+    pub risk_reward_basis: &'static str,
+    pub min_recent_analog_samples: usize,
     pub interval_secs: u64,
     pub lookback_hours: i64,
     pub max_points: i64,
@@ -63,10 +65,12 @@ pub struct LabConfig {
 impl Default for LabConfig {
     fn default() -> Self {
         Self {
-            engine_version: 3,
+            engine_version: 4,
             risk_reward: 3.0,
+            risk_reward_basis: "net_after_fees_at_executable_levels",
+            min_recent_analog_samples: 8,
             interval_secs: 30,
-            lookback_hours: 24,
+            lookback_hours: 72,
             max_points: 750_000,
             target_win_rate: 0.80,
             min_win_lower_bound: 0.55,
@@ -104,6 +108,11 @@ impl LabConfig {
         c.max_spread_bps = env_num("MAX_SPREAD_BPS", c.max_spread_bps).clamp(0.1, 50.);
         c.min_analog_samples =
             env_num("MIN_ANALOG_SAMPLES", c.min_analog_samples as f64).clamp(8., 200.) as usize;
+        c.min_recent_analog_samples = env_num(
+            "MIN_RECENT_ANALOG_SAMPLES",
+            c.min_recent_analog_samples as f64,
+        )
+        .clamp(8., c.min_analog_samples as f64) as usize;
         c.analog_neighbors = env_num("ANALOG_NEIGHBORS", c.analog_neighbors as f64)
             .clamp(c.min_analog_samples as f64, 250.) as usize;
         c.cooldown_secs =
@@ -134,7 +143,7 @@ impl LabConfig {
         let hash = json.bytes().fold(0xcbf29ce484222325_u64, |h, b| {
             (h ^ b as u64).wrapping_mul(0x100000001b3)
         });
-        format!("v3-{hash:016x}")
+        format!("v{}-{hash:016x}", self.engine_version)
     }
 }
 
@@ -203,6 +212,61 @@ pub fn pnl(direction: &str, entry: f64, exit: f64, fee_bps: f64) -> (f64, f64) {
     } * 10_000.;
     // Fees are charged on actual entry AND exit notionals, including shorts.
     (gross, gross - fee_bps * (1. + ratio))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RiskLevels {
+    pub target_price: f64,
+    pub stop_price: f64,
+    pub target_net_bps: f64,
+    pub stop_net_bps: f64,
+    pub target_move: f64,
+    pub net_reward_risk: f64,
+}
+
+/// Prices are executable fills AFTER slippage. Solve fees on both actual notionals,
+/// rather than multiplying the gross stop distance. Adverse stop gaps can lose more.
+pub fn net_risk_levels(
+    direction: &str,
+    entry: f64,
+    stop_move: f64,
+    fee_bps: f64,
+    reward_risk: f64,
+) -> Option<RiskLevels> {
+    if ![entry, stop_move, fee_bps, reward_risk]
+        .iter()
+        .all(|v| v.is_finite())
+        || entry <= 0.
+        || !(0. ..1.).contains(&stop_move)
+        || stop_move == 0.
+        || !(0. ..10_000.).contains(&fee_bps)
+        || reward_risk <= 0.
+        || !matches!(direction, "LONG" | "SHORT")
+    {
+        return None;
+    }
+    let long = direction == "LONG";
+    let stop_price = entry * (1. + if long { -stop_move } else { stop_move });
+    let stop_net_bps = pnl(direction, entry, stop_price, fee_bps).1;
+    let desired_net = -stop_net_bps * reward_risk;
+    let ratio = if long {
+        (desired_net + 10_000. + fee_bps) / (10_000. - fee_bps)
+    } else {
+        (10_000. - fee_bps - desired_net) / (10_000. + fee_bps)
+    };
+    let target_price = entry * ratio;
+    if !target_price.is_finite() || target_price <= 0. || desired_net <= 0. {
+        return None;
+    }
+    let target_net_bps = pnl(direction, entry, target_price, fee_bps).1;
+    Some(RiskLevels {
+        target_price,
+        stop_price,
+        target_net_bps,
+        stop_net_bps,
+        target_move: (ratio - 1.).abs(),
+        net_reward_risk: target_net_bps / -stop_net_bps,
+    })
 }
 
 pub fn win_interval(wins: i64, total: i64) -> (f64, f64) {
@@ -330,6 +394,30 @@ pub fn reports(items: &[Prediction], config: &LabConfig) -> Vec<StrategyReport> 
 mod tests {
     use super::*;
     use crate::test_support::prediction;
+
+    #[test]
+    fn net_targets_pay_three_times_planned_net_loss_for_both_sides() {
+        for direction in ["LONG", "SHORT"] {
+            for entry in [100., 85_632.535_89] {
+                for fee in [0., 10., 100.] {
+                    for stop_move in [0.001, 0.01, 0.015] {
+                        let levels = net_risk_levels(direction, entry, stop_move, fee, 3.).unwrap();
+                        let loss = pnl(direction, entry, levels.stop_price, fee).1;
+                        let reward = pnl(direction, entry, levels.target_price, fee).1;
+                        assert!(loss < 0. && reward > 0.);
+                        assert!((reward / -loss - 3.).abs() < 1e-8);
+                    }
+                }
+            }
+        }
+        // Regression for the uploaded report: 10 bps stop + 20 bps fees used
+        // to leave ~10 bps reward for ~30 bps risk. V4 targets ~90 bps NET.
+        let levels = net_risk_levels("LONG", 100., 0.001, 10., 3.).unwrap();
+        assert!((levels.target_net_bps - 89.97).abs() < 1e-8);
+        assert!(levels.target_move * 10_000. > 110.);
+        assert!(net_risk_levels("SHORT", 100., 0.9, 10., 3.).is_none());
+        assert!(net_risk_levels("LONG", 0., 0.001, 10., 3.).is_none());
+    }
 
     #[test]
     fn long_and_short_pay_both_fees_and_adverse_slippage() {

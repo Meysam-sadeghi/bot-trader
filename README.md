@@ -140,6 +140,26 @@ Separate pages:
 
 Each exchange page now shows **both exchanges together**, with six comparison cards per exchange and a common 1 / 5 / 15 / 60 minute horizon selector. Use **Start BOTH exchanges** to run all 48 strategy/horizon lanes. The existing per-exchange Start/Stop controls remain available.
 
+## V4: net risk/reward and evidence-gated entries
+
+After **Update System**, new paper trades use a separate `v4-...` configuration and `*_v4` strategy IDs. Existing positions, configurations, exports and outcomes are preserved. Open V3 trades finish using their stored target, stop and costs; they are not moved to V4 or repriced.
+
+V4 fixes the distinction between **gross price distance** and **net reward/risk**. A 10 bps gross stop and 30 bps gross target with approximately 20 bps round-trip fees leave about 30 bps net risk but only 10 bps net reward. V4 solves the target price so that planned net target profit is **three times planned net stop loss**, accounting for fees on both actual notionals. Entry and exit fills already incorporate spread and adverse slippage. An adverse stop gap can still lose more than planned; a time-limit exit is not guaranteed to realize that ratio.
+
+For example, with a LONG entry fill of 100, a 0.1% stop and 10 bps fee per side, planned stop loss is 29.99 bps and planned target profit is 89.97 bps. Increasing the target does not establish that the market will reach it. V4 therefore requires historical evidence before **any** of the six strategies may open a position:
+
+- At least `MIN_ANALOG_SAMPLES` valid non-overlapping past analogs (default 24), with completed outcomes and a feature-window embargo before the current signal.
+- Positive weighted **and** unweighted mean net results at least `MIN_SIGNAL_EDGE_BPS` (default 2 bps), replayed using the same net target/stop solver and current fee/slippage assumptions.
+- The newest `MIN_RECENT_ANALOG_SAMPLES` selected analogs (default 8) must also have positive mean net results above the same edge threshold. The recent set is selected by time before checking path usability.
+- No selected path may have an unverifiable fill or missing price path. Historical entry and timeout sizes must cover the modeled position. A barrier-crossing five-second bar must have enough top-book size throughout the bar because intrabar size/price order is unknown. This is conservative; a missing stop cannot be silently excluded to inflate evidence.
+- Selective consensus additionally retains its peer/trend agreement, historical target-hit-rate and Wilson-bound requirements. Other strategies do not claim an 80% win probability.
+
+The default lookback is now **72 hours**; existing environment overrides are respected. Continuous history of at least approximately 2.5 / 4.1 / 8.1 / 26.1 hours is needed even to fit 24 disjoint feature-and-outcome windows for the 1 / 5 / 15 / 60 minute lanes. Similarity selection, gaps and insufficient liquidity can require more history. `ANALYSIS_MAX_POINTS` still caps raw inputs and may reduce available history below the requested lookback. The dashboard shows waiting/rejection reasons and history truncation. No entry is the intended outcome when evidence is insufficient.
+
+Accepted positions export the weighted, unweighted and recent net estimates, rejected-path count, entry checks and actual planned net target/stop amounts. For V4, `expected_return` is the weighted historical net estimate divided by 10,000; it is not a predicted log return or a proven future return. The `planned_net_reward_risk` diagnostic also reveals the actual after-fee ratio on older V3 positions.
+
+This is still historical selection evidence. Fresh forward results are necessary to assess whether a strategy works. Multi-level order-book execution remains a separate improvement: this release retains the explicit top-book fill limitation and reports unfillable live exits as unknown.
+
 ## Position diagnostics and export
 
 برای بررسی وین‌ریت پایین، پس از **Update System** در بخش **Position diagnostics** روی **Download diagnostics JSON** بزنید و فایل را برای تحلیل ارسال کنید. پیش‌فرض، هر دو صرافی، همهٔ استراتژی‌ها، همهٔ بازه‌ها و تنظیمات قدیمی را شامل می‌شود. **Clear Data** اطلاعات مورد نیاز تحلیل را حذف می‌کند؛ برای خروجی گرفتن نیازی به آن نیست.
@@ -153,7 +173,7 @@ Filters support exchange, symbol, strategy, horizon, exit status, configuration 
 
 New positions save the closed-window features, quote timestamps, exact accepted rule values, entry bid/ask and available size before the outcome exists. Execution audits preserve first/last/best/worst observed quotes and modeled net marks, quote counts, maximum gap and exit details. These are compact observations, **not a full tick-path archive**. Quote extrema use uncapped hypothetical executable fills; an actual favorable target fill remains capped at the target. Fees are gross minus net; spread and slippage are already in fills and must not be deducted twice.
 
-Existing trades and cohort IDs are preserved. Old positions cannot recover entry features that were never saved. They export `not_recorded` evidence and status-inferred exits. A V3 position already open during the update receives a `partial_after_upgrade` audit. Legacy outcomes retain the original gross-price accounting; legacy notional/config defaults are not recovered account facts. This update instruments the existing rules; it does not claim to improve or establish any live-market win rate.
+Existing trades and cohort IDs are preserved. Old positions cannot recover entry features that were never saved. They export `not_recorded` evidence and status-inferred exits. A position predating audit recording receives a `partial_after_upgrade` audit. Legacy outcomes retain the original gross-price accounting; legacy notional/config defaults are not recovered account facts. Diagnostic recording itself does not establish any live-market win rate.
 
 Recorded exit codes:
 
@@ -168,7 +188,7 @@ Recorded exit codes:
 
 The JSON distinguishes profitable/losing outcomes from missing data and reports both profitable/all-closed and profitable/priced-closed rates. The latter excludes unknown outcomes and must not be substituted silently for the dashboard metric. Observations can identify execution, cost and signal patterns; they do not by themselves prove the market cause of a loss.
 
-## Parallel Strategy Lab V3
+## Parallel Strategy Lab V3 (previous rules, retained in the archive)
 
 Every exchange uses the same strategy definitions. Binance is no longer exclusively inverted: the old reversal idea is retained as a separate control on **both** exchanges.
 
@@ -287,13 +307,14 @@ ANALYSIS_INTERVAL_SECS=30
 # Parallel Strategy Lab V3.
 # TARGET_STRICT_WIN_RATE is a historical analog admission threshold,
 # not a promise that forward results will equal this percentage.
-ANALYSIS_LOOKBACK_HOURS=24
+ANALYSIS_LOOKBACK_HOURS=72
 ANALYSIS_MAX_POINTS=750000
 TARGET_STRICT_WIN_RATE=0.80
 MIN_WIN_LOWER_BOUND=0.55
 MIN_SIGNAL_EDGE_BPS=2.0
 MAX_SPREAD_BPS=3.0
 MIN_ANALOG_SAMPLES=24
+MIN_RECENT_ANALOG_SAMPLES=8
 ANALOG_NEIGHBORS=80
 REENTRY_COOLDOWN_SECS=180
 MAX_QUOTE_AGE_MS=5000

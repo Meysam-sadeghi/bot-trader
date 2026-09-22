@@ -64,7 +64,7 @@
         <strong>Automatic mode</strong>
         <span>Capture → Analyze → Paper Trade</span>
         <span id="strategy-mode">Strategy: loading…</span>
-        <span>Gross risk : reward = 1 : 3</span>
+        <span>V4 · Planned NET risk : reward = 1 : 3</span>
         <span>Maximum hold = 60 minutes</span>
       </section>
 
@@ -129,6 +129,7 @@
             </select>
           </label>
         </div>
+        <p class="research-note">V4 requires positive historical net evidence for every strategy before opening a position. No sufficient evidence means no trade; the waiting reason appears on each card. Planned target profit is three times planned stop loss after fees. Gaps can worsen the actual stop fill. Older configurations remain in the export archive.</p>
         <p class="research-note">80% is a research target, not a promised result. Net win rate counts every closed position, including timeouts and data gaps. Each strategy and horizon has its own equal starting capital. Balances use the pair’s quote asset (USDT for BTCUSDT). Rule scores are not win probabilities.</p>
         <div id="comparison-exchanges" aria-live="polite"><p class="empty">Loading strategy accounts…</p></div>
         <p class="research-note">95% Wilson intervals are descriptive and assume independent trials; market regimes and overlapping horizons can correlate results. Closed-trade drawdown excludes intratrade moves. SHORT positions are synthetic spot-price research; borrowing, funding, queue priority and execution latency are not modeled.</p>
@@ -200,7 +201,7 @@
         </div>
         <p>
           Start BOTH exchanges collects Binance and Bybit data and evaluates all six strategies at 1, 5, 15 and 60 minutes.
-          Signals use completed windows; the selective model uses past, non-overlapping analog paths and fresh peer confirmation.
+          Signals use completed windows; every strategy requires past, non-overlapping analog paths with positive net results, including recent evidence. The selective model also requires fresh peer confirmation.
           Each strategy/horizon may hold one position. The spread, fees and adverse slippage are included in net results.
           Historical results keep their original configuration. A data gap is flagged instead of inventing an exit price.
         </p>

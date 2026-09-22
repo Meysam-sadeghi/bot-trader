@@ -165,8 +165,16 @@ impl AnalysisManager {
                     } else if quote.entry_qty(signal.direction) < self.config.notional / entry {
                         "Insufficient visible top-book size".into()
                     } else {
-                        let sign = if signal.direction == "LONG" { 1. } else { -1. };
+                        let levels = paper::net_risk_levels(
+                            signal.direction,
+                            entry,
+                            signal.stop_move,
+                            self.config.fee(exchange),
+                            self.config.risk_reward,
+                        )
+                        .context("No valid net risk/reward levels; entry rejected")?;
                         let mut entry_snapshot = signal.snapshot;
+                        entry_snapshot["risk"]["execution_levels"] = json!(levels);
                         entry_snapshot["execution"] = json!({
                             "decision_at": decision_at,
                             "quote": quote,
@@ -195,9 +203,8 @@ impl AnalysisManager {
                             horizon_secs: signal.horizon,
                             direction: signal.direction.into(),
                             entry_price: entry,
-                            target_price: entry
-                                * (1. + sign * signal.stop_move * self.config.risk_reward),
-                            stop_price: entry * (1. - sign * signal.stop_move),
+                            target_price: levels.target_price,
+                            stop_price: levels.stop_price,
                             confidence: signal.evidence,
                             score: signal.score,
                             expected_return: signal.expected_return,
@@ -469,9 +476,9 @@ fn build_signals(
                 && score * f.book_imbalance_60s > 0.01
                 && score * f.ret_15s > 0.;
             let mut sign = match strategy {
-                "flow_follow_v3" if flow_setup => score.signum(),
-                "flow_reverse_v3" if flow_setup => -score.signum(),
-                "trend_pullback_v3"
+                "flow_follow_v4" if flow_setup => score.signum(),
+                "flow_reverse_v4" if flow_setup => -score.signum(),
+                "trend_pullback_v4"
                     if f.trend_efficiency >= 0.30
                         && f.ret_300s * f.ret_60s > 0.
                         && f.ret_15s * f.ret_300s < 0.
@@ -480,7 +487,7 @@ fn build_signals(
                 {
                     f.ret_300s.signum()
                 }
-                "breakout_v3"
+                "breakout_v4"
                     if f.breakout != 0.
                         && f.volume_ratio >= 1.25
                         && f.trade_intensity_ratio >= 1.10
@@ -489,7 +496,7 @@ fn build_signals(
                 {
                     f.breakout
                 }
-                "range_reversion_v3"
+                "range_reversion_v4"
                     if f.trend_efficiency <= 0.25
                         && f.range_position.abs() >= 0.75
                         && f.flow_15s * f.range_position < -0.10
@@ -499,57 +506,86 @@ fn build_signals(
                 }
                 _ => 0.,
             };
-            if strategy == "consensus_v3" {
-                reason = "Waiting for independent historical analogs".into();
+            if strategy == "consensus_v4" {
+                reason = "Waiting for historical analogs and fresh peer/trend agreement".into();
                 if let Some(a) = &analog {
                     let direction_sign = a.expected_return.signum();
-                    if a.neighbors.len() >= c.min_analog_samples {
-                        reason = "Waiting for fresh agreement from both exchanges and trend".into();
-                        if score * direction_sign > 0.2
-                            && f.ret_300s * direction_sign > 0.
-                            && peer_score.is_some_and(|p| p * direction_sign > 0.2)
-                        {
-                            let direction = if direction_sign > 0. { "LONG" } else { "SHORT" };
-                            let b = barrier_stats(
-                                &buckets,
-                                &a.neighbors,
-                                steps,
-                                direction,
-                                stop_move * 3.,
-                                stop_move,
-                                c.fee(exchange),
-                                c.slippage_bps,
-                            );
-                            analog_evidence = Some(json!({
-                                "barriers": b,
-                                "expected_log_return": a.expected_return,
-                                "neighbors": a.neighbors.iter().map(|n| json!({
-                                    "feature_window_start": buckets[n.index - 60].ts,
-                                    "outcome_start": buckets[n.index].ts,
-                                    "outcome_end_exclusive": buckets[n.index + steps].ts + 5000,
-                                    "log_return": n.future_return,
-                                    "weight": n.weight
-                                })).collect::<Vec<_>>()
-                            }));
-                            evidence = b.weighted_strict_win_rate;
-                            expected = b.expected_net_bps / 10_000.;
-                            reason = format!(
-                                "Analog evidence: {} independent samples, {:.1}% net TP wins, lower bound {:.1}%, net edge {:.2} bps",
-                                b.samples,
-                                evidence * 100.,
-                                b.wilson_lower_bound * 100.,
-                                b.expected_net_bps
-                            );
-                            if b.samples >= c.min_analog_samples
-                                && evidence >= c.target_win_rate
-                                && b.wins as f64 / b.samples as f64 >= c.target_win_rate
-                                && b.wilson_lower_bound >= c.min_win_lower_bound
-                                && b.expected_net_bps >= c.min_edge_bps
-                            {
-                                sign = direction_sign;
-                            }
-                        }
+                    if score * direction_sign > 0.2
+                        && f.ret_300s * direction_sign > 0.
+                        && peer_score.is_some_and(|p| p * direction_sign > 0.2)
+                    {
+                        sign = direction_sign;
                     }
+                }
+            }
+            // Every strategy must earn entry through cost-aware historical evidence.
+            // A rule score or a larger target alone is never sufficient.
+            if sign != 0. {
+                let direction = if sign > 0. { "LONG" } else { "SHORT" };
+                if let Some(a) = &analog {
+                    let b = barrier_stats(
+                        &buckets,
+                        &a.neighbors,
+                        steps,
+                        direction,
+                        stop_move,
+                        c.fee(exchange),
+                        c,
+                    );
+                    evidence = b.weighted_strict_win_rate;
+                    expected = b.expected_net_bps / 10_000.;
+                    let checks = evidence_checks(&b, strategy == "consensus_v4", c);
+                    let passed = checks.iter().all(|g| g["passed"] == true);
+                    reason = format!(
+                        "{}: {} valid / {} selected analogs, weighted net {:.2} bps, mean net {:.2} bps, recent {}/{} net {:.2} bps; {}",
+                        if passed {
+                            "Historical entry gate passed"
+                        } else {
+                            "No entry"
+                        },
+                        b.samples,
+                        a.neighbors.len(),
+                        b.expected_net_bps,
+                        b.mean_net_bps,
+                        b.recent_samples,
+                        c.min_recent_analog_samples,
+                        b.recent_mean_net_bps,
+                        if passed {
+                            "forward profitability is unproven".into()
+                        } else {
+                            checks
+                                .iter()
+                                .filter(|g| g["passed"] != true)
+                                .filter_map(|g| g["name"].as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    );
+                    analog_evidence = Some(json!({
+                        "barriers": b,
+                        "checks": checks,
+                        "required_samples": c.min_analog_samples,
+                        "required_recent_samples": c.min_recent_analog_samples,
+                        "recent_selection": "newest selected analogs by time, including unusable paths in coverage check",
+                        "expected_log_return": a.expected_return,
+                        "neighbors": a.neighbors.iter().map(|n| json!({
+                            "feature_window_start": buckets[n.index - 60].ts,
+                            "outcome_start": buckets[n.index].ts,
+                            "outcome_end_exclusive": buckets[n.index + steps].ts + 5000,
+                            "log_return": n.future_return,
+                            "weight": n.weight
+                        })).collect::<Vec<_>>()
+                    }));
+                    if !passed {
+                        sign = 0.;
+                    }
+                } else {
+                    reason = format!(
+                        "No entry: need {} usable, non-overlapping analogs (at least {:.1} hours of continuous history for this horizon; event caps may shorten it)",
+                        c.min_analog_samples,
+                        (c.min_analog_samples as i64 * (horizon + 300) + 305) as f64 / 3600.
+                    );
+                    sign = 0.;
                 }
             }
             diagnostic.lanes.push(LaneDiagnostic {
@@ -561,7 +597,7 @@ fn build_signals(
                 let direction = if sign > 0. { "LONG" } else { "SHORT" };
                 let snapshot = json!({
                     "schema_version": 1,
-                    "rules_version": "v3-original",
+                    "rules_version": "v4-net-risk-all-strategies-evidence",
                     "evaluated_at": at,
                     "history_cutoff_exclusive": cutoff,
                     "history_start": buckets[0].ts,
@@ -571,28 +607,42 @@ fn build_signals(
                     "feature_quote_at": buckets[i].quote_ts,
                     "features": f,
                     "raw_microstructure_score": score,
-                    "direction_rule": if strategy == "flow_reverse_v3" { "opposite_of_flow_score" } else { strategy },
+                    "direction_rule": if strategy == "flow_reverse_v4" { "opposite_of_flow_score" } else { strategy },
                     "rule_checks": entry_rule_checks(strategy, &f, score, sign, peer_score, analog_evidence.as_ref(), c),
                     "peer": {
                         "exchange": if exchange == Exchange::Binance { Exchange::Bybit } else { Exchange::Binance },
                         "quote_at": peer_buckets.last().and_then(|b| b.quote_ts),
                         "features": peer_feature,
                         "microstructure_score": peer_score,
-                        "required_for_entry": strategy == "consensus_v3"
+                        "required_for_entry": strategy == "consensus_v4"
                     },
                     "risk": {
                         "sigma_per_5s": sigma,
                         "estimated_round_trip_cost_bps": costs,
                         "stop_distance_bps": stop_move * 10_000.,
-                        "target_distance_bps": stop_move * c.risk_reward * 10_000.,
-                        "risk_reward_before_fees": c.risk_reward
+                        "target_distance_bps": paper::net_risk_levels(direction, 1., stop_move, c.fee(exchange), c.risk_reward).map(|l| l.target_move * 10_000.),
+                        "risk_reward_after_fees": c.risk_reward,
+                        "basis": c.risk_reward_basis,
+                        "gap_risk": "stop fills can be worse than the planned level"
                     },
                     "analog_evidence": analog_evidence,
                     "score_is_win_probability": false
                 });
-                signals.push(Signal { strategy, horizon, direction, stop_move, evidence,
-                    score: if strategy == "flow_reverse_v3" { -score } else { score }, expected_return: expected,
-                    reason: if strategy == "consensus_v3" { reason } else { format!("{strategy}: closed-window setup; rule score {:.3} (not a win probability)", score * sign) }, snapshot });
+                signals.push(Signal {
+                    strategy,
+                    horizon,
+                    direction,
+                    stop_move,
+                    evidence,
+                    score: if strategy == "flow_reverse_v4" {
+                        -score
+                    } else {
+                        score
+                    },
+                    expected_return: expected,
+                    reason: format!("{strategy}: {reason}"),
+                    snapshot,
+                });
             }
         }
     }
@@ -626,7 +676,7 @@ fn entry_rule_checks(
         c.max_spread_bps,
     )];
     checks.extend(match strategy {
-        "flow_follow_v3" | "flow_reverse_v3" => vec![
+        "flow_follow_v4" | "flow_reverse_v4" => vec![
             gate("absolute_flow_score", score.abs(), ">=", 0.30),
             gate("score_times_flow_60s", score * f.flow_60s, ">", 0.02),
             gate(
@@ -637,7 +687,7 @@ fn entry_rule_checks(
             ),
             gate("score_times_return_15s", score * f.ret_15s, ">", 0.),
         ],
-        "trend_pullback_v3" => vec![
+        "trend_pullback_v4" => vec![
             gate("trend_efficiency", f.trend_efficiency, ">=", 0.30),
             gate("return_300s_times_60s", f.ret_300s * f.ret_60s, ">", 0.),
             gate("return_15s_times_300s", f.ret_15s * f.ret_300s, "<", 0.),
@@ -649,7 +699,7 @@ fn entry_rule_checks(
                 0.,
             ),
         ],
-        "breakout_v3" => vec![
+        "breakout_v4" => vec![
             gate("breakout", f.breakout, "!=", 0.),
             gate("volume_ratio", f.volume_ratio, ">=", 1.25),
             gate("trade_intensity_ratio", f.trade_intensity_ratio, ">=", 1.10),
@@ -661,7 +711,7 @@ fn entry_rule_checks(
                 0.15,
             ),
         ],
-        "range_reversion_v3" => vec![
+        "range_reversion_v4" => vec![
             gate("trend_efficiency", f.trend_efficiency, "<=", 0.25),
             gate(
                 "absolute_range_position",
@@ -682,7 +732,7 @@ fn entry_rule_checks(
                 0.,
             ),
         ],
-        "consensus_v3" => {
+        "consensus_v4" => {
             let b = &analog.expect("accepted consensus has evidence")["barriers"];
             let n = b["samples"].as_f64().unwrap_or(0.);
             vec![
@@ -723,7 +773,29 @@ fn entry_rule_checks(
         }
         _ => Vec::new(),
     });
+    if let Some(gates) = analog.and_then(|a| a["checks"].as_array()) {
+        checks.extend(gates.iter().cloned());
+    }
     json!(checks)
+}
+
+fn evidence_checks(b: &BarrierStats, consensus: bool, c: &LabConfig) -> Vec<serde_json::Value> {
+    let mut checks = vec![
+        json!({"name": "valid_analog_count", "value": b.samples, "minimum": c.min_analog_samples, "passed": b.samples >= c.min_analog_samples}),
+        json!({"name": "no_unverifiable_selected_paths", "value": b.unverifiable, "maximum": 0, "passed": b.unverifiable == 0}),
+        json!({"name": "positive_weighted_net_edge", "value": b.expected_net_bps, "minimum": c.min_edge_bps, "passed": b.expected_net_bps > 0. && b.expected_net_bps >= c.min_edge_bps}),
+        json!({"name": "positive_unweighted_net_edge", "value": b.mean_net_bps, "minimum": c.min_edge_bps, "passed": b.mean_net_bps > 0. && b.mean_net_bps >= c.min_edge_bps}),
+        json!({"name": "recent_valid_analog_count", "value": b.recent_samples, "minimum": c.min_recent_analog_samples, "passed": b.recent_samples >= c.min_recent_analog_samples}),
+        json!({"name": "positive_recent_net_edge", "value": b.recent_mean_net_bps, "minimum": c.min_edge_bps, "passed": b.recent_mean_net_bps > 0. && b.recent_mean_net_bps >= c.min_edge_bps}),
+    ];
+    if consensus {
+        checks.extend([
+            json!({"name": "consensus_weighted_target_rate", "value": b.weighted_strict_win_rate, "minimum": c.target_win_rate, "passed": b.weighted_strict_win_rate >= c.target_win_rate}),
+            json!({"name": "consensus_raw_target_rate", "value": b.wins as f64 / b.samples.max(1) as f64, "minimum": c.target_win_rate, "passed": b.wins as f64 / b.samples.max(1) as f64 >= c.target_win_rate}),
+            json!({"name": "consensus_wilson_lower_bound", "value": b.wilson_lower_bound, "minimum": c.min_win_lower_bound, "passed": b.wilson_lower_bound >= c.min_win_lower_bound}),
+        ]);
+    }
+    checks
 }
 
 #[derive(Debug, Clone, Default)]
@@ -744,6 +816,8 @@ struct Bucket {
     bid_low: Option<f64>,
     ask_high: Option<f64>,
     ask_low: Option<f64>,
+    min_bid_qty: Option<f64>,
+    min_ask_qty: Option<f64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -790,6 +864,10 @@ struct BarrierStats {
     weighted_strict_win_rate: f64,
     wilson_lower_bound: f64,
     expected_net_bps: f64,
+    mean_net_bps: f64,
+    recent_samples: usize,
+    recent_mean_net_bps: f64,
+    unverifiable: usize,
 }
 
 fn build_buckets(points: &[MarketPoint], max_gap_ms: i64) -> Vec<Bucket> {
@@ -831,6 +909,8 @@ fn build_buckets(points: &[MarketPoint], max_gap_ms: i64) -> Vec<Bucket> {
             b.ask_price = Some(ask);
             b.bid_qty = Some(bq);
             b.ask_qty = Some(aq);
+            b.min_bid_qty = Some(b.min_bid_qty.unwrap_or(bq).min(bq));
+            b.min_ask_qty = Some(b.min_ask_qty.unwrap_or(aq).min(aq));
             b.quote_ts = Some(point.ts);
         }
     }
@@ -854,6 +934,8 @@ fn build_buckets(points: &[MarketPoint], max_gap_ms: i64) -> Vec<Bucket> {
             b.ask_price = prev.ask_price;
             b.bid_qty = prev.bid_qty;
             b.ask_qty = prev.ask_qty;
+            b.min_bid_qty = prev.bid_qty;
+            b.min_ask_qty = prev.ask_qty;
             b.quote_ts = prev.quote_ts;
             b.high_price = b.price;
             b.low_price = b.price;
@@ -1062,7 +1144,7 @@ fn pattern_forecast(
         }
     }
 
-    if neighbors.len() < 8 {
+    if neighbors.is_empty() {
         return None;
     }
 
@@ -1082,85 +1164,46 @@ fn pattern_forecast(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn barrier_stats(
     buckets: &[Bucket],
     neighbors: &[Neighbor],
     horizon_steps: usize,
     direction: &str,
-    target_move: f64,
     stop_move: f64,
     fee_bps: f64,
-    slip_bps: f64,
+    c: &LabConfig,
 ) -> BarrierStats {
     let mut stats = BarrierStats::default();
     let mut win_weight = 0.;
     let mut total_weight = 0.;
     let mut net_weight = 0.;
-    for neighbor in neighbors {
-        let start = &buckets[neighbor.index];
-        let Some(end) = neighbor
-            .index
-            .checked_add(horizon_steps)
-            .filter(|e| *e < buckets.len())
-        else {
+    let mut net_sum = 0.;
+    let mut recent_sum = 0.;
+    let mut ordered: Vec<_> = neighbors.iter().collect();
+    ordered.sort_by_key(|n| std::cmp::Reverse(n.index));
+    for (rank, neighbor) in ordered.into_iter().enumerate() {
+        let Some(net_outcome) = replay_analog(
+            buckets,
+            neighbor.index,
+            horizon_steps,
+            direction,
+            stop_move,
+            fee_bps,
+            c,
+        ) else {
+            stats.unverifiable += 1;
             continue;
         };
-        // Never invent future paths across a capture outage, or use incomplete labels.
-        if buckets[neighbor.index..=end]
-            .iter()
-            .any(|b| b.price.is_none())
-        {
-            continue;
-        }
-        let (Some(bid), Some(ask)) = (start.bid_price, start.ask_price) else {
-            continue;
-        };
-        let entry = paper::entry_fill(direction, bid, ask, slip_bps);
-        let sign = if direction == "LONG" { 1. } else { -1. };
-        let target = entry * (1. + sign * target_move);
-        let stop = entry * (1. - sign * stop_move);
-        let mut outcome = "TIMEOUT";
-        let last = &buckets[end];
-        let Some(mark) = (if direction == "LONG" {
-            last.bid_price
-        } else {
-            last.ask_price
-        }) else {
-            continue;
-        };
-        let mut exit = paper::exit_fill(direction, mark, slip_bps);
-        for b in &buckets[neighbor.index + 1..=end] {
-            let (Some(high), Some(low)) = (if direction == "LONG" {
-                (b.bid_high, b.bid_low)
-            } else {
-                (b.ask_high, b.ask_low)
-            }) else {
-                continue;
-            };
-            let high = paper::exit_fill(direction, high, slip_bps);
-            let low = paper::exit_fill(direction, low, slip_bps);
-            let (target_hit, stop_hit) = if direction == "LONG" {
-                (high >= target, low <= stop)
-            } else {
-                (low <= target, high >= stop)
-            };
-            // Intrabucket order is unknown: charge the adverse extreme on ambiguous bars.
-            if stop_hit {
-                outcome = "LOSS";
-                exit = if direction == "LONG" { low } else { high };
-                break;
-            }
-            if target_hit {
-                outcome = "WIN";
-                exit = target;
-                break;
-            }
-        }
-        let net = paper::pnl(direction, entry, exit, fee_bps).1;
+        let (outcome, net) = net_outcome;
         stats.samples += 1;
         total_weight += neighbor.weight;
         net_weight += net * neighbor.weight;
+        net_sum += net;
+        // Select the recent cohort by chronology BEFORE excluding unusable paths.
+        if rank < c.min_recent_analog_samples {
+            stats.recent_samples += 1;
+            recent_sum += net;
+        }
         match outcome {
             "WIN" if net > 0. => {
                 stats.wins += 1;
@@ -1174,8 +1217,90 @@ fn barrier_stats(
         stats.weighted_strict_win_rate = win_weight / total_weight;
         stats.expected_net_bps = net_weight / total_weight;
     }
+    if stats.samples > 0 {
+        stats.mean_net_bps = net_sum / stats.samples as f64;
+    }
+    if stats.recent_samples > 0 {
+        stats.recent_mean_net_bps = recent_sum / stats.recent_samples as f64;
+    }
     stats.wilson_lower_bound = paper::win_interval(stats.wins as i64, stats.samples as i64).0;
     stats
+}
+
+fn replay_analog(
+    buckets: &[Bucket],
+    index: usize,
+    horizon_steps: usize,
+    direction: &str,
+    stop_move: f64,
+    fee_bps: f64,
+    c: &LabConfig,
+) -> Option<(&'static str, f64)> {
+    let end = index.checked_add(horizon_steps)?;
+    let path = buckets.get(index..=end)?;
+    if path.iter().any(|b| b.price.is_none()) {
+        return None;
+    }
+    let start = path.first()?;
+    if start.ts + 4999 - start.quote_ts? > c.max_quote_age_ms {
+        return None;
+    }
+    let entry = paper::entry_fill(
+        direction,
+        start.bid_price?,
+        start.ask_price?,
+        c.slippage_bps,
+    );
+    let qty = c.notional / entry;
+    let long = direction == "LONG";
+    let entry_qty = if long { start.ask_qty? } else { start.bid_qty? };
+    if entry_qty < qty {
+        return None;
+    }
+    let levels = paper::net_risk_levels(direction, entry, stop_move, fee_bps, c.risk_reward)?;
+    for b in path.iter().skip(1) {
+        let (high, low) = if long {
+            (b.bid_high?, b.bid_low?)
+        } else {
+            (b.ask_high?, b.ask_low?)
+        };
+        let high = paper::exit_fill(direction, high, c.slippage_bps);
+        let low = paper::exit_fill(direction, low, c.slippage_bps);
+        let (target_hit, stop_hit) = if long {
+            (high >= levels.target_price, low <= levels.stop_price)
+        } else {
+            (low <= levels.target_price, high >= levels.stop_price)
+        };
+        if target_hit || stop_hit {
+            // Intrabucket quote/size order is unknown: require enough size throughout
+            // the crossing bar. Never exclude an unfillable stop and keep only wins.
+            let available = if long { b.min_bid_qty? } else { b.min_ask_qty? };
+            if available < qty {
+                return None;
+            }
+            let (status, fill) = if stop_hit {
+                ("LOSS", if long { low } else { high })
+            } else {
+                ("WIN", levels.target_price)
+            };
+            return Some((status, paper::pnl(direction, entry, fill, fee_bps).1));
+        }
+    }
+    let last = path.last()?;
+    if last.ts + 4999 - last.quote_ts? > c.max_gap_ms {
+        return None;
+    }
+    let available = if long { last.bid_qty? } else { last.ask_qty? };
+    if available < qty {
+        return None;
+    }
+    let mark = if long {
+        last.bid_price?
+    } else {
+        last.ask_price?
+    };
+    let exit = paper::exit_fill(direction, mark, c.slippage_bps);
+    Some(("TIMEOUT", paper::pnl(direction, entry, exit, fee_bps).1))
 }
 
 fn feature_distance(left: &Feature, right: &Feature) -> f64 {
@@ -1304,6 +1429,127 @@ fn standard_deviation(values: &[f64]) -> f64 {
 mod tests {
     use super::*;
     use crate::test_support::{event, prediction, quote};
+
+    #[test]
+    fn every_strategy_waits_when_only_ten_minutes_of_history_exist() {
+        let points: Vec<_> = (0..655)
+            .flat_map(|n| {
+                let q = point(n * 1000, 100. + n as f64 * 0.002);
+                let mut trade = q.clone();
+                trade.kind = "trade".into();
+                trade.qty = Some(3.);
+                trade.side = Some("BUY".into());
+                [q, trade]
+            })
+            .collect();
+        for exchange in [Exchange::Binance, Exchange::Bybit] {
+            let (signals, d) =
+                build_signals(&points, &points, exchange, 655000, &LabConfig::default()).unwrap();
+            assert!(signals.is_empty());
+            assert_eq!(d.lanes.len(), 24);
+            assert!(d.lanes.iter().any(|d| d.reason.contains("No entry")));
+        }
+    }
+
+    #[test]
+    fn cost_gate_rejects_negative_recent_evidence_and_unverifiable_selected_stops() {
+        let c = LabConfig::default();
+        let mut b = BarrierStats {
+            samples: 24,
+            wins: 24,
+            weighted_strict_win_rate: 1.,
+            wilson_lower_bound: 0.86,
+            expected_net_bps: 8.,
+            mean_net_bps: 6.,
+            recent_samples: 8,
+            recent_mean_net_bps: 4.,
+            ..Default::default()
+        };
+        let passes = |b: &BarrierStats, consensus| {
+            evidence_checks(b, consensus, &c)
+                .iter()
+                .all(|v| v["passed"] == true)
+        };
+        assert!(passes(&b, false));
+        assert!(passes(&b, true));
+        b.recent_mean_net_bps = -1.;
+        assert!(!passes(&b, false));
+        b.recent_mean_net_bps = 4.;
+        b.unverifiable = 1;
+        assert!(!passes(&b, false));
+        b.unverifiable = 0;
+        b.expected_net_bps = 0.;
+        assert!(!passes(&b, false));
+        b.expected_net_bps = 8.;
+        b.samples = 23;
+        assert!(!passes(&b, false));
+    }
+
+    #[test]
+    fn historical_small_gross_profit_becomes_negative_after_fees() {
+        let points: Vec<_> = (0..13)
+            .map(|n| point(n * 5000, 100. + n as f64 * 0.005))
+            .collect();
+        let buckets = build_buckets(&points, 15000);
+        let c = LabConfig::default();
+        let gross = replay_analog(&buckets, 0, 12, "LONG", 0.001, 0., &c)
+            .unwrap()
+            .1;
+        let net = replay_analog(&buckets, 0, 12, "LONG", 0.001, 10., &c)
+            .unwrap()
+            .1;
+        assert!(gross > 0. && net < 0.);
+        assert!((gross - net - 20.).abs() < 0.1);
+    }
+
+    #[test]
+    fn historical_unfillable_stop_cannot_disappear_from_the_entry_gate() {
+        let mut points = vec![point(0, 100.), point(5000, 98.)];
+        points[1].bid_qty = Some(0.0001);
+        let buckets = build_buckets(&points, 15000);
+        let b = barrier_stats(
+            &buckets,
+            &[Neighbor {
+                index: 0,
+                future_return: -0.02,
+                weight: 1.,
+            }],
+            1,
+            "LONG",
+            0.001,
+            10.,
+            &LabConfig::default(),
+        );
+        assert_eq!(b.samples, 0);
+        assert_eq!(b.unverifiable, 1);
+        assert!(
+            !evidence_checks(&b, false, &LabConfig::default())
+                .iter()
+                .all(|v| v["passed"] == true)
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrading_to_v4_preserves_open_v3_targets_and_costs() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let mut old = prediction();
+        old.config_id = "v3-8d10a4e5f3f477e9".into();
+        old.strategy = "flow_follow_v3".into();
+        db.insert_prediction(&old).await.unwrap();
+        db.insert_event(event(Exchange::Binance, "book_ticker", 2000, 104.))
+            .await
+            .unwrap();
+        let manager = AnalysisManager::new(db.clone());
+        assert_eq!(manager.config.engine_version, 4);
+        manager.resolve_open_predictions().await.unwrap();
+        let saved = db.prediction_by_id(&old.id).await.unwrap().unwrap();
+        assert_eq!(saved.status, "WIN");
+        assert_eq!(saved.config_id, old.config_id);
+        assert_eq!(saved.target_price, old.target_price);
+        assert_eq!(saved.stop_price, old.stop_price);
+        assert_eq!(saved.exit_price, Some(old.target_price));
+        assert!((saved.pnl_bps.unwrap() - 279.7).abs() < 1e-8);
+    }
 
     #[test]
     fn first_executable_crossing_wins_and_later_stop_is_ignored() {
@@ -1502,7 +1748,7 @@ mod tests {
             future_return: 0.,
             weight: 1.,
         }];
-        let b = barrier_stats(&buckets, &n, 1, "LONG", 0.03, 0.01, 10., 1.);
+        let b = barrier_stats(&buckets, &n, 1, "LONG", 0.01, 10., &LabConfig::default());
         assert_eq!(b.losses, 1);
         assert_eq!(b.wins, 0);
         assert!(b.expected_net_bps < 0.);
@@ -1515,22 +1761,27 @@ mod tests {
             future_return: 0.04,
             weight: 1.,
         }];
-        let b = barrier_stats(&buckets, &n, 12, "LONG", 0.03, 0.01, 10., 1.);
+        let b = barrier_stats(&buckets, &n, 12, "LONG", 0.01, 10., &LabConfig::default());
         assert_eq!(b.samples, 0);
     }
-    #[test]
-    fn partial_or_future_buckets_do_not_change_the_signal() {
-        let at = 655000;
-        let mut points: Vec<_> = (0..655)
+    fn repeating_market() -> Vec<MarketPoint> {
+        // Synthetic history for execution/gating tests, not evidence of profitability.
+        (0..3921)
             .flat_map(|n| {
-                let q = point(n * 1000, 100. + n as f64 * 0.002);
+                let q = point(n * 5000, 100. + (n % 120) as f64 * 0.05);
                 let mut trade = q.clone();
                 trade.kind = "trade".into();
                 trade.qty = Some(3.);
                 trade.side = Some("BUY".into());
                 [q, trade]
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn partial_or_future_buckets_do_not_change_the_signal() {
+        let mut points = repeating_market();
+        let at = points.last().unwrap().ts + 5000;
         let c = LabConfig::default();
         let (a, _) = build_signals(&points, &points, Exchange::Binance, at, &c).unwrap();
         assert!(!a.is_empty());
@@ -1545,22 +1796,29 @@ mod tests {
         assert_eq!(shape(a), shape(b));
     }
     #[tokio::test]
-    async fn both_exchanges_open_independent_forward_and_reverse_lanes_without_duplicates() {
+    async fn both_exchanges_only_open_evidence_backed_lanes_without_duplicates() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let manager = AnalysisManager::new(db.clone());
         db.register_config(&manager.config).await.unwrap();
         let at = now_ms();
-        let start = (at - 650000) / 1000 * 1000;
+        let points = repeating_market();
+        let offset = at / 5000 * 5000 - 5000 - points.last().unwrap().ts;
         for exchange in [Exchange::Binance, Exchange::Bybit] {
-            for ts in (start..at).step_by(1000) {
-                let price = 100. + (ts - start) as f64 / 500000.;
-                db.insert_event(event(exchange, "book_ticker", ts, price))
-                    .await
-                    .unwrap();
-                db.insert_event(event(exchange, "trade", ts, price))
-                    .await
-                    .unwrap();
+            for point in &points {
+                let mut e = event(
+                    exchange,
+                    &point.kind,
+                    point.ts + offset,
+                    (point.bid_price.unwrap() + point.ask_price.unwrap()) / 2.,
+                );
+                e.qty = point.qty;
+                e.side = point.side.clone();
+                db.insert_event(e).await.unwrap();
             }
+            // Fresh execution quote; it cannot enter the preceding closed signal window.
+            db.insert_event(event(exchange, "book_ticker", at, 104.))
+                .await
+                .unwrap();
         }
         db.flush().await.unwrap();
         for exchange in [Exchange::Binance, Exchange::Bybit] {
@@ -1570,26 +1828,18 @@ mod tests {
                 .experiment_predictions(exchange, "BTCUSDT", &manager.config.id())
                 .await
                 .unwrap();
-            assert_eq!(rows.len(), 8);
-            assert_eq!(
-                rows.iter()
-                    .filter(|p| p.strategy == "flow_follow_v3" && p.direction == "LONG")
-                    .count(),
-                4
+            assert!(
+                !rows.is_empty(),
+                "synthetic profitable history should pass at least one lane"
             );
-            assert_eq!(
-                rows.iter()
-                    .filter(|p| p.strategy == "flow_reverse_v3" && p.direction == "SHORT")
-                    .count(),
-                4
-            );
+            let unique: std::collections::HashSet<_> =
+                rows.iter().map(|p| (&p.strategy, p.horizon_secs)).collect();
+            assert_eq!(unique.len(), rows.len());
             for p in rows {
-                assert!(
-                    ((p.target_price - p.entry_price).abs() / (p.stop_price - p.entry_price).abs()
-                        - 3.)
-                        .abs()
-                        < 1e-8
-                );
+                let target_net =
+                    paper::pnl(&p.direction, p.entry_price, p.target_price, p.fee_bps).1;
+                let stop_net = paper::pnl(&p.direction, p.entry_price, p.stop_price, p.fee_bps).1;
+                assert!((target_net / -stop_net - 3.).abs() < 1e-8);
                 assert!(p.created_at >= at);
                 assert!(p.fee_bps > 0.);
                 let snapshot = p.entry_snapshot.as_ref().unwrap();
