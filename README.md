@@ -140,6 +140,34 @@ Separate pages:
 
 Each exchange page now shows **both exchanges together**, with six comparison cards per exchange and a common 1 / 5 / 15 / 60 minute horizon selector. Use **Start BOTH exchanges** to run all 48 strategy/horizon lanes. The existing per-exchange Start/Stop controls remain available.
 
+## Position diagnostics and export
+
+برای بررسی وین‌ریت پایین، پس از **Update System** در بخش **Position diagnostics** روی **Download diagnostics JSON** بزنید و فایل را برای تحلیل ارسال کنید. پیش‌فرض، هر دو صرافی، همهٔ استراتژی‌ها، همهٔ بازه‌ها و تنظیمات قدیمی را شامل می‌شود. **Clear Data** اطلاعات مورد نیاز تحلیل را حذف می‌کند؛ برای خروجی گرفتن نیازی به آن نیست.
+
+- **Download diagnostics JSON**: full positions, immutable entry inputs, measured rule checks/thresholds, peer features, analog evidence where used, original configuration parameters, execution evidence and grouped outcome counts.
+- **Download CSV**: a flat Excel-compatible comparison, including numeric features, costs, outcome categories and embedded evidence JSON. Text cells beginning with spreadsheet formula characters are escaped; numeric losses remain numeric.
+- **Preview loss breakdown**: stop losses, losing timeouts, unverifiable paths, fee-related losses and trades that gave back an observed net profit. Groups separate exchange, symbol, configuration, strategy, horizon and direction. Fee-related and giveback counts are overlapping subsets, not extra losses.
+- **Details** beside a position: inspect recorded entry conditions, thresholds, costs, quote extrema and the specific exit trigger.
+
+Filters support exchange, symbol, strategy, horizon, exit status, configuration and entry-time range. Browser date controls use your local time, converted to UTC milliseconds. The end is exclusive. The download uses one SQLite read snapshot and is independent of the recent-position table's 120/500-row limits. It includes all matching positions up to **25,000**; a larger selection returns an explicit error asking for a narrower range, never a silently truncated file. JSON states the filters, record count and evidence coverage.
+
+New positions save the closed-window features, quote timestamps, exact accepted rule values, entry bid/ask and available size before the outcome exists. Execution audits preserve first/last/best/worst observed quotes and modeled net marks, quote counts, maximum gap and exit details. These are compact observations, **not a full tick-path archive**. Quote extrema use uncapped hypothetical executable fills; an actual favorable target fill remains capped at the target. Fees are gross minus net; spread and slippage are already in fills and must not be deducted twice.
+
+Existing trades and cohort IDs are preserved. Old positions cannot recover entry features that were never saved. They export `not_recorded` evidence and status-inferred exits. A V3 position already open during the update receives a `partial_after_upgrade` audit. Legacy outcomes retain the original gross-price accounting; legacy notional/config defaults are not recovered account facts. This update instruments the existing rules; it does not claim to improve or establish any live-market win rate.
+
+Recorded exit codes:
+
+| Code | Recorded event |
+| --- | --- |
+| `take_profit` / `stop_loss` | First executable target/stop crossing |
+| `horizon_timeout` | Time limit, using a sufficiently fresh executable mark |
+| `quote_gap` / `feed_stale` | Missing continuous quotes / no timely quote while holding |
+| `invalid_or_delayed_quote` / `quote_out_of_order` | Invalid price/size/event time / backward receipt timestamp |
+| `insufficient_exit_liquidity` | A barrier was crossed without enough visible size to fill |
+| `timeout_quote_stale` / `timeout_insufficient_liquidity` | Time-limit exit cannot be verified from recent liquid quotes |
+
+The JSON distinguishes profitable/losing outcomes from missing data and reports both profitable/all-closed and profitable/priced-closed rates. The latter excludes unknown outcomes and must not be substituted silently for the dashboard metric. Observations can identify execution, cost and signal patterns; they do not by themselves prove the market cause of a loss.
+
 ## Parallel Strategy Lab V3
 
 Every exchange uses the same strategy definitions. Binance is no longer exclusively inverted: the old reversal idea is retained as a separate control on **both** exchanges.
@@ -331,7 +359,14 @@ GET /api/dashboard/bybit
 GET /api/predictions/binance
 GET /api/predictions/bybit
 GET /api/predictions/binance?config=all&limit=500
+GET /api/positions/{position-id}
+GET /api/exports/positions?format=json
+GET /api/exports/positions?format=csv&exchange=bybit&config=current
+GET /api/exports/positions?format=json&exchange=binance&strategy=flow_follow_v3&horizon=300&from_ms=1700000000000&to_ms=1700086400000
+GET /api/exports/summary
 ```
+
+Export filters default to `all`. `config` accepts `all`, `current`, `legacy` or an exact cohort ID. `status` filters the exit label (`OPEN`, `WIN`, `LOSS`, `TIMEOUT`, `DATA_GAP`), not net profitability; a timeout can be profitable or losing. No credentials or raw market archives are included.
 
 Browser realtime stream:
 
@@ -366,7 +401,7 @@ Bybit WS + REST snapshot ──┘             │
 
 ## Validation and remaining research
 
-`cargo test --locked --all-targets` exercises execution costs, quote ordering, stop gaps, timeouts, data outages, legacy migrations, restart checkpoints, cohort separation, independent lanes, closed-window/no-future signals, purged analogs and both exchange flows. Synthetic fixtures prove software behavior only; they are not profitable-strategy evidence.
+`cargo test --locked --all-targets` exercises execution costs, quote ordering, stop gaps, timeouts, data outages, legacy migrations, restart checkpoints, cohort separation, independent lanes, closed-window/no-future signals and snapshots, purged analogs, both exchange flows, immutable entry evidence, exit/quote audit persistence, export filtering beyond the dashboard limit, explicit oversized-export rejection, loss categories and CSV escaping. Synthetic fixtures prove software behavior only; they are not profitable-strategy evidence.
 
 Further research before any separate live-execution project includes chronological replay on real captured datasets, held-out regimes, parameter selection bias, full-depth fills/latency/borrowing and intratrade portfolio drawdown. No real-trading switch is included.
 

@@ -130,6 +130,8 @@ impl Database {
                 "entry_reason",
                 "TEXT NOT NULL DEFAULT 'Legacy gross-price simulation'",
             ),
+            ("entry_snapshot", "TEXT"),
+            ("execution_audit", "TEXT"),
         ] {
             if !existing.iter().any(|c| c == name) {
                 sqlx::query(&format!(
@@ -347,8 +349,9 @@ impl Database {
             id, exchange, symbol, created_at, horizon_secs, direction,
             entry_price, target_price, stop_price, confidence, score, expected_return,
             strategy, status, config_id, fee_bps, slippage_bps, notional,
-            cursor_id, last_quote_ts, mark_price, max_gap_ms, entry_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            cursor_id, last_quote_ts, mark_price, max_gap_ms, entry_reason,
+            entry_snapshot, execution_audit
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&p.id)
         .bind(p.exchange.to_string())
@@ -373,6 +376,18 @@ impl Database {
         .bind(p.mark_price)
         .bind(p.max_gap_ms)
         .bind(&p.entry_reason)
+        .bind(
+            p.entry_snapshot
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        )
+        .bind(
+            p.execution_audit
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        )
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -425,6 +440,83 @@ impl Database {
         .await?)
     }
 
+    /// A single SQLite read snapshot includes both positions and their original configs.
+    /// Never reuse the dashboard's 120/500-row limits for an export.
+    pub async fn export_positions(
+        &self,
+        filters: &crate::export::ExportFilters,
+    ) -> anyhow::Result<crate::export::ExportSnapshot> {
+        let mut tx = self.pool.begin().await?;
+        let mut query =
+            sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT * FROM predictions WHERE 1=1");
+        if let Some(exchange) = filters.exchange {
+            query
+                .push(" AND exchange = ")
+                .push_bind(exchange.to_string());
+        }
+        for (column, value) in [
+            ("symbol", &filters.symbol),
+            ("strategy", &filters.strategy),
+            ("config_id", &filters.config_id),
+            ("status", &filters.status),
+        ] {
+            if let Some(value) = value {
+                query.push(format!(" AND {column} = ")).push_bind(value);
+            }
+        }
+        if let Some(horizon) = filters.horizon_secs {
+            query.push(" AND horizon_secs = ").push_bind(horizon);
+        }
+        if let Some(from) = filters.from_ms {
+            query.push(" AND created_at >= ").push_bind(from);
+        }
+        if let Some(to) = filters.to_ms {
+            query.push(" AND created_at < ").push_bind(to);
+        }
+        query
+            .push(" ORDER BY created_at, id LIMIT ")
+            .push_bind(crate::export::MAX_EXPORT_POSITIONS + 1);
+        let rows = query.build().fetch_all(&mut *tx).await?;
+        if rows.len() as i64 > crate::export::MAX_EXPORT_POSITIONS {
+            return Err(crate::export::ExportTooLarge.into());
+        }
+        let positions = rows
+            .into_iter()
+            .map(row_to_prediction)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let config_ids: std::collections::HashSet<_> =
+            positions.iter().map(|p| p.config_id.as_str()).collect();
+        let rows =
+            sqlx::query("SELECT id, json, created_at FROM lab_configs ORDER BY created_at, id")
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut configurations = Vec::new();
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            if config_ids.contains(id.as_str()) {
+                configurations.push(serde_json::json!({
+                    "id": id,
+                    "registered_at": row.try_get::<i64, _>("created_at")?,
+                    "parameters": serde_json::from_str::<serde_json::Value>(&row.try_get::<String, _>("json")?)?
+                }));
+            }
+        }
+        tx.commit().await?;
+        Ok(crate::export::ExportSnapshot {
+            positions,
+            configurations,
+        })
+    }
+
+    pub async fn prediction_by_id(&self, id: &str) -> anyhow::Result<Option<Prediction>> {
+        sqlx::query("SELECT * FROM predictions WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(row_to_prediction)
+            .transpose()
+    }
+
     pub async fn latest_quote(
         &self,
         exchange: Exchange,
@@ -448,15 +540,19 @@ impl Database {
     }
 
     pub async fn checkpoint(&self, p: &Prediction) -> anyhow::Result<()> {
-        sqlx::query("UPDATE predictions SET cursor_id = ?, last_quote_ts = ?, mark_price = ? WHERE id = ? AND status = 'OPEN'")
-            .bind(p.cursor_id).bind(p.last_quote_ts).bind(p.mark_price).bind(&p.id).execute(&self.pool).await?;
+        sqlx::query("UPDATE predictions SET cursor_id = ?, last_quote_ts = ?, mark_price = ?, execution_audit = ? WHERE id = ? AND status = 'OPEN'")
+            .bind(p.cursor_id).bind(p.last_quote_ts).bind(p.mark_price)
+            .bind(p.execution_audit.as_ref().map(serde_json::to_string).transpose()?)
+            .bind(&p.id).execute(&self.pool).await?;
         Ok(())
     }
 
     pub async fn finish(&self, p: &Prediction) -> anyhow::Result<()> {
-        sqlx::query("UPDATE predictions SET status = ?, resolved_at = ?, exit_price = ?, pnl_bps = ?, gross_pnl_bps = ?, cursor_id = ?, last_quote_ts = ?, mark_price = ? WHERE id = ? AND status = 'OPEN'")
+        sqlx::query("UPDATE predictions SET status = ?, resolved_at = ?, exit_price = ?, pnl_bps = ?, gross_pnl_bps = ?, cursor_id = ?, last_quote_ts = ?, mark_price = ?, execution_audit = ? WHERE id = ? AND status = 'OPEN'")
             .bind(&p.status).bind(p.resolved_at).bind(p.exit_price).bind(p.pnl_bps).bind(p.gross_pnl_bps)
-            .bind(p.cursor_id).bind(p.last_quote_ts).bind(p.mark_price).bind(&p.id).execute(&self.pool).await?;
+            .bind(p.cursor_id).bind(p.last_quote_ts).bind(p.mark_price)
+            .bind(p.execution_audit.as_ref().map(serde_json::to_string).transpose()?)
+            .bind(&p.id).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -579,10 +675,18 @@ fn row_to_prediction(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Prediction>
         mark_price: row.try_get("mark_price")?,
         max_gap_ms: row.try_get("max_gap_ms")?,
         entry_reason: row.try_get("entry_reason")?,
+        entry_snapshot: row
+            .try_get::<Option<String>, _>("entry_snapshot")?
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?,
+        execution_audit: row
+            .try_get::<Option<String>, _>("execution_audit")?
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?,
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Quote {
     pub id: i64,
     pub ts: i64,
@@ -691,6 +795,8 @@ mod tests {
             "mark_price",
             "max_gap_ms",
             "entry_reason",
+            "entry_snapshot",
+            "execution_audit",
         ] {
             sqlx::query(&format!("ALTER TABLE predictions DROP COLUMN {name}"))
                 .execute(&db.pool)
@@ -708,11 +814,38 @@ mod tests {
         assert_eq!(rows[0].config_id, "legacy");
         assert_eq!(rows[0].fee_bps, 0.);
         assert_eq!(rows[0].strategy, "normal");
+        assert!(rows[0].entry_snapshot.is_none());
+        assert!(rows[0].execution_audit.is_none());
         assert!(
             db.experiment_predictions(Exchange::Binance, "BTCUSDT", &LabConfig::default().id())
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_export_fails_explicitly_instead_of_returning_a_partial_file() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < ?) INSERT INTO predictions(id,exchange,symbol,created_at,horizon_secs,direction,entry_price,target_price,stop_price,confidence,score,expected_return,status) SELECT 'limit-' || i,'binance','BTCUSDT',i,60,'LONG',100,103,99,0,0,0,'LOSS' FROM n")
+            .bind(crate::export::MAX_EXPORT_POSITIONS + 1).execute(&db.pool).await.unwrap();
+        let result = db
+            .export_positions(&crate::export::ExportFilters::default())
+            .await;
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .downcast_ref::<crate::export::ExportTooLarge>()
+                .is_some()
+        );
+        let filters = crate::export::ExportFilters {
+            to_ms: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(
+            db.export_positions(&filters).await.unwrap().positions.len(),
+            99
         );
     }
 
@@ -777,7 +910,22 @@ mod tests {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let mut p = prediction();
         p.fee_bps = 7.5;
+        p.entry_snapshot = Some(serde_json::json!({"features": {"flow_60s": 0.65}}));
+        p.execution_audit = Some(crate::audit::ExecutionAudit::start(&p, true, 1000));
+        crate::audit::observe(
+            &mut p,
+            &crate::test_support::quote(1, 1000, 99.99, 100.01),
+            true,
+        );
         db.insert_prediction(&p).await.unwrap();
+        // Checkpoint/finish must never rewrite the original entry evidence, even if
+        // an in-memory caller mistakenly mutates it during resolution.
+        p.entry_snapshot = Some(serde_json::json!({"features": {"flow_60s": -1}}));
+        crate::audit::observe(
+            &mut p,
+            &crate::test_support::quote(42, 2300, 101., 101.01),
+            true,
+        );
         p.cursor_id = 42;
         p.last_quote_ts = 2300;
         p.mark_price = Some(101.);
@@ -786,12 +934,59 @@ mod tests {
         assert_eq!(saved.fee_bps, 7.5);
         assert_eq!(saved.cursor_id, 42);
         assert_eq!(saved.mark_price, Some(101.));
+        assert_eq!(
+            saved.entry_snapshot.as_ref().unwrap()["features"]["flow_60s"],
+            0.65
+        );
+        assert_eq!(
+            saved
+                .execution_audit
+                .as_ref()
+                .unwrap()
+                .best
+                .as_ref()
+                .unwrap()
+                .quote
+                .id,
+            42
+        );
         p.status = "WIN".into();
         p.pnl_bps = Some(15.);
         p.gross_pnl_bps = Some(30.);
         p.resolved_at = Some(2500);
         p.exit_price = Some(103.);
+        crate::audit::record_exit(&mut p, "take_profit", 2500, None);
         db.finish(&p).await.unwrap();
         assert!(db.open_predictions().await.unwrap().is_empty());
+        let closed = db.prediction_by_id(&p.id).await.unwrap().unwrap();
+        assert_eq!(
+            closed.entry_snapshot.as_ref().unwrap()["features"]["flow_60s"],
+            0.65
+        );
+        assert_eq!(
+            closed
+                .execution_audit
+                .as_ref()
+                .unwrap()
+                .exit
+                .as_ref()
+                .unwrap()
+                .code,
+            "take_profit"
+        );
+        // A delayed resolver checkpoint cannot overwrite a closed position's audit.
+        let mut stale = saved;
+        stale.execution_audit = None;
+        db.checkpoint(&stale).await.unwrap();
+        assert!(
+            db.prediction_by_id(&p.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .execution_audit
+                .unwrap()
+                .exit
+                .is_some()
+        );
     }
 }

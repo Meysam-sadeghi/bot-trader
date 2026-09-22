@@ -1,9 +1,11 @@
 use crate::{
+    audit::{self, ExecutionAudit},
     db::{Database, Quote},
     model::{Exchange, MarketPoint, Prediction, now_ms},
     paper::{self, Diagnostics, HORIZONS, LabConfig, LaneDiagnostic, STRATEGIES},
 };
 use anyhow::Context;
+use serde_json::json;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
@@ -164,7 +166,28 @@ impl AnalysisManager {
                         "Insufficient visible top-book size".into()
                     } else {
                         let sign = if signal.direction == "LONG" { 1. } else { -1. };
-                        let p = Prediction {
+                        let mut entry_snapshot = signal.snapshot;
+                        entry_snapshot["execution"] = json!({
+                            "decision_at": decision_at,
+                            "quote": quote,
+                            "quote_age_ms": decision_at - quote.ts,
+                            "signal_age_ms": decision_at - at,
+                            "spread_bps": spread,
+                            "required_base_qty": self.config.notional / entry,
+                            "available_entry_base_qty": quote.entry_qty(signal.direction),
+                            "entry_fill_after_slippage": entry,
+                            "fee_bps_per_side": self.config.fee(exchange),
+                            "slippage_bps_per_side": self.config.slippage_bps,
+                            "checks": {
+                                "no_open_position_in_lane": true,
+                                "cooldown_passed": true,
+                                "sufficient_paper_equity": true,
+                                "quote_valid_and_fresh": true,
+                                "spread_within_limit": true,
+                                "visible_entry_size_sufficient": true
+                            }
+                        });
+                        let mut p = Prediction {
                             id: Uuid::new_v4().to_string(),
                             exchange,
                             symbol: symbol.into(),
@@ -195,7 +218,11 @@ impl AnalysisManager {
                                 .then(|| quote.exit_price(signal.direction)),
                             max_gap_ms: self.config.max_gap_ms,
                             entry_reason: signal.reason,
+                            entry_snapshot: Some(entry_snapshot),
+                            execution_audit: None,
                         };
+                        p.execution_audit = Some(ExecutionAudit::start(&p, true, decision_at));
+                        audit::observe(&mut p, &quote, true);
                         self.db.insert_prediction(&p).await?;
                         "Paper position opened".into()
                     }
@@ -269,13 +296,27 @@ impl AnalysisManager {
 /// Same ordered quote logic is used by deterministic replay tests and the live resolver.
 fn advance_position(p: &mut Prediction, quotes: &[Quote], now: i64, drained: bool) {
     let deadline = p.created_at + p.horizon_secs * 1000;
+    if p.execution_audit.is_none() {
+        // An already-open position has no recoverable entry snapshot or earlier extrema.
+        p.execution_audit = Some(ExecutionAudit::start(p, false, now));
+    }
     for q in quotes {
         p.cursor_id = q.id;
         if q.ts <= p.created_at || q.ts > deadline {
             continue;
         }
-        if q.ts < p.last_quote_ts || !q.valid() || q.ts - p.last_quote_ts > p.max_gap_ms {
-            invalidate(p, q.ts.min(deadline));
+        let invalid_reason = if q.ts < p.last_quote_ts {
+            Some("quote_out_of_order")
+        } else if !q.valid() {
+            Some("invalid_or_delayed_quote")
+        } else if q.ts - p.last_quote_ts > p.max_gap_ms {
+            Some("quote_gap")
+        } else {
+            None
+        };
+        audit::observe(p, q, invalid_reason.is_none());
+        if let Some(reason) = invalid_reason {
+            invalidate(p, q.ts.min(deadline), reason, Some(q));
             return;
         }
         // Thin liquidity while holding is not an exit. Only a requested fill
@@ -290,7 +331,7 @@ fn advance_position(p: &mut Prediction, quotes: &[Quote], now: i64, drained: boo
             (fill <= p.target_price, fill >= p.stop_price)
         };
         if (target_hit || stop_hit) && !liquid {
-            invalidate(p, q.ts);
+            invalidate(p, q.ts, "insufficient_exit_liquidity", Some(q));
             return;
         }
         if stop_hit {
@@ -306,7 +347,7 @@ fn advance_position(p: &mut Prediction, quotes: &[Quote], now: i64, drained: boo
     if drained {
         if now >= deadline {
             if deadline - p.last_quote_ts > p.max_gap_ms {
-                invalidate(p, deadline);
+                invalidate(p, deadline, "timeout_quote_stale", None);
             } else if let Some(mark) = p.mark_price {
                 close(
                     p,
@@ -315,20 +356,21 @@ fn advance_position(p: &mut Prediction, quotes: &[Quote], now: i64, drained: boo
                     paper::exit_fill(&p.direction, mark, p.slippage_bps),
                 );
             } else {
-                invalidate(p, deadline);
+                invalidate(p, deadline, "timeout_insufficient_liquidity", None);
             }
         } else if now - p.last_quote_ts > p.max_gap_ms {
-            invalidate(p, now);
+            invalidate(p, now, "feed_stale", None);
         }
     }
 }
-fn invalidate(p: &mut Prediction, ts: i64) {
+fn invalidate(p: &mut Prediction, ts: i64, reason: &str, quote: Option<&Quote>) {
     p.status = "DATA_GAP".into();
     p.resolved_at = Some(ts);
     p.pnl_bps = None;
     p.gross_pnl_bps = None;
     p.exit_price = None;
     p.mark_price = None;
+    audit::record_exit(p, reason, ts, quote);
 }
 fn close(p: &mut Prediction, status: &str, ts: i64, fill: f64) {
     let (gross, net) = paper::pnl(&p.direction, p.entry_price, fill, p.fee_bps);
@@ -337,6 +379,16 @@ fn close(p: &mut Prediction, status: &str, ts: i64, fill: f64) {
     p.exit_price = Some(fill);
     p.gross_pnl_bps = Some(gross);
     p.pnl_bps = Some(net);
+    audit::record_exit(
+        p,
+        match status {
+            "WIN" => "take_profit",
+            "LOSS" => "stop_loss",
+            _ => "horizon_timeout",
+        },
+        ts,
+        None,
+    );
 }
 
 struct Signal {
@@ -348,6 +400,7 @@ struct Signal {
     score: f64,
     expected_return: f64,
     reason: String,
+    snapshot: serde_json::Value,
 }
 
 fn build_signals(
@@ -378,11 +431,11 @@ fn build_signals(
     );
     let peer_closed = &peer_points[..peer_points.partition_point(|p| p.ts < cutoff)];
     let peer_buckets = build_buckets(peer_closed, c.max_gap_ms);
-    let peer_score = peer_buckets
+    let peer_feature = peer_buckets
         .last()
         .filter(|b| at - b.quote_ts.unwrap_or(0) <= c.max_quote_age_ms + 5000)
-        .and_then(|_| feature_at(&peer_buckets, peer_buckets.len() - 1))
-        .map(|f| microstructure_score(&f));
+        .and_then(|_| feature_at(&peer_buckets, peer_buckets.len() - 1));
+    let peer_score = peer_feature.as_ref().map(microstructure_score);
     let score = microstructure_score(&f);
     let mut signals = Vec::new();
     let mut diagnostic = Diagnostics {
@@ -407,6 +460,7 @@ fn build_signals(
             .clamp(0.0001, 0.015);
         let analog = pattern_forecast(&buckets, &features, i, steps, &f, c.analog_neighbors);
         for (strategy, _, _) in STRATEGIES {
+            let mut analog_evidence = None;
             let mut evidence = 0.;
             let mut expected = 0.;
             let mut reason = "Waiting for this strategy's market setup".to_string();
@@ -466,6 +520,17 @@ fn build_signals(
                                 c.fee(exchange),
                                 c.slippage_bps,
                             );
+                            analog_evidence = Some(json!({
+                                "barriers": b,
+                                "expected_log_return": a.expected_return,
+                                "neighbors": a.neighbors.iter().map(|n| json!({
+                                    "feature_window_start": buckets[n.index - 60].ts,
+                                    "outcome_start": buckets[n.index].ts,
+                                    "outcome_end_exclusive": buckets[n.index + steps].ts + 5000,
+                                    "log_return": n.future_return,
+                                    "weight": n.weight
+                                })).collect::<Vec<_>>()
+                            }));
                             evidence = b.weighted_strict_win_rate;
                             expected = b.expected_net_bps / 10_000.;
                             reason = format!(
@@ -494,14 +559,173 @@ fn build_signals(
             });
             if sign != 0. {
                 let direction = if sign > 0. { "LONG" } else { "SHORT" };
+                let snapshot = json!({
+                    "schema_version": 1,
+                    "rules_version": "v3-original",
+                    "evaluated_at": at,
+                    "history_cutoff_exclusive": cutoff,
+                    "history_start": buckets[0].ts,
+                    "history_minutes": diagnostic.history_minutes,
+                    "history_truncated": diagnostic.history_truncated,
+                    "input_points": closed.len(),
+                    "feature_quote_at": buckets[i].quote_ts,
+                    "features": f,
+                    "raw_microstructure_score": score,
+                    "direction_rule": if strategy == "flow_reverse_v3" { "opposite_of_flow_score" } else { strategy },
+                    "rule_checks": entry_rule_checks(strategy, &f, score, sign, peer_score, analog_evidence.as_ref(), c),
+                    "peer": {
+                        "exchange": if exchange == Exchange::Binance { Exchange::Bybit } else { Exchange::Binance },
+                        "quote_at": peer_buckets.last().and_then(|b| b.quote_ts),
+                        "features": peer_feature,
+                        "microstructure_score": peer_score,
+                        "required_for_entry": strategy == "consensus_v3"
+                    },
+                    "risk": {
+                        "sigma_per_5s": sigma,
+                        "estimated_round_trip_cost_bps": costs,
+                        "stop_distance_bps": stop_move * 10_000.,
+                        "target_distance_bps": stop_move * c.risk_reward * 10_000.,
+                        "risk_reward_before_fees": c.risk_reward
+                    },
+                    "analog_evidence": analog_evidence,
+                    "score_is_win_probability": false
+                });
                 signals.push(Signal { strategy, horizon, direction, stop_move, evidence,
                     score: if strategy == "flow_reverse_v3" { -score } else { score }, expected_return: expected,
-                    reason: if strategy == "consensus_v3" { reason } else { format!("{strategy}: closed-window setup; rule score {:.3} (not a win probability)", score * sign) } });
+                    reason: if strategy == "consensus_v3" { reason } else { format!("{strategy}: closed-window setup; rule score {:.3} (not a win probability)", score * sign) }, snapshot });
             }
         }
     }
     Ok((signals, diagnostic))
 }
+
+fn entry_rule_checks(
+    strategy: &str,
+    f: &Feature,
+    score: f64,
+    sign: f64,
+    peer_score: Option<f64>,
+    analog: Option<&serde_json::Value>,
+    c: &LabConfig,
+) -> serde_json::Value {
+    let gate = |name: &str, value: f64, comparison: &str, threshold: f64| {
+        let passed = match comparison {
+            ">" => value > threshold,
+            ">=" => value >= threshold,
+            "<" => value < threshold,
+            "<=" => value <= threshold,
+            "!=" => value != threshold,
+            _ => false,
+        };
+        json!({"name": name, "value": value, "comparison": comparison, "threshold": threshold, "passed": passed})
+    };
+    let mut checks = vec![gate(
+        "closed_window_spread_bps",
+        f.spread_bps,
+        "<=",
+        c.max_spread_bps,
+    )];
+    checks.extend(match strategy {
+        "flow_follow_v3" | "flow_reverse_v3" => vec![
+            gate("absolute_flow_score", score.abs(), ">=", 0.30),
+            gate("score_times_flow_60s", score * f.flow_60s, ">", 0.02),
+            gate(
+                "score_times_book_60s",
+                score * f.book_imbalance_60s,
+                ">",
+                0.01,
+            ),
+            gate("score_times_return_15s", score * f.ret_15s, ">", 0.),
+        ],
+        "trend_pullback_v3" => vec![
+            gate("trend_efficiency", f.trend_efficiency, ">=", 0.30),
+            gate("return_300s_times_60s", f.ret_300s * f.ret_60s, ">", 0.),
+            gate("return_15s_times_300s", f.ret_15s * f.ret_300s, "<", 0.),
+            gate("turn_times_return_300s", f.turn * f.ret_300s, ">", 0.),
+            gate(
+                "flow_300s_times_return_300s",
+                f.flow_300s * f.ret_300s,
+                ">",
+                0.,
+            ),
+        ],
+        "breakout_v3" => vec![
+            gate("breakout", f.breakout, "!=", 0.),
+            gate("volume_ratio", f.volume_ratio, ">=", 1.25),
+            gate("trade_intensity_ratio", f.trade_intensity_ratio, ">=", 1.10),
+            gate("score_times_breakout", score * f.breakout, ">", 0.20),
+            gate(
+                "flow_60s_times_breakout",
+                f.flow_60s * f.breakout,
+                ">",
+                0.15,
+            ),
+        ],
+        "range_reversion_v3" => vec![
+            gate("trend_efficiency", f.trend_efficiency, "<=", 0.25),
+            gate(
+                "absolute_range_position",
+                f.range_position.abs(),
+                ">=",
+                0.75,
+            ),
+            gate(
+                "flow_15s_times_range",
+                f.flow_15s * f.range_position,
+                "<",
+                -0.10,
+            ),
+            gate(
+                "acceleration_times_range",
+                f.acceleration * f.range_position,
+                "<",
+                0.,
+            ),
+        ],
+        "consensus_v3" => {
+            let b = &analog.expect("accepted consensus has evidence")["barriers"];
+            let n = b["samples"].as_f64().unwrap_or(0.);
+            vec![
+                gate("score_times_direction", score * sign, ">", 0.2),
+                gate("trend_times_direction", f.ret_300s * sign, ">", 0.),
+                gate(
+                    "peer_score_times_direction",
+                    peer_score.unwrap_or(0.) * sign,
+                    ">",
+                    0.2,
+                ),
+                gate("independent_analogs", n, ">=", c.min_analog_samples as f64),
+                gate(
+                    "weighted_strict_win_rate",
+                    b["weighted_strict_win_rate"].as_f64().unwrap_or(0.),
+                    ">=",
+                    c.target_win_rate,
+                ),
+                gate(
+                    "raw_strict_win_rate",
+                    b["wins"].as_f64().unwrap_or(0.) / n.max(1.),
+                    ">=",
+                    c.target_win_rate,
+                ),
+                gate(
+                    "wilson_lower_bound",
+                    b["wilson_lower_bound"].as_f64().unwrap_or(0.),
+                    ">=",
+                    c.min_win_lower_bound,
+                ),
+                gate(
+                    "expected_net_bps",
+                    b["expected_net_bps"].as_f64().unwrap_or(0.),
+                    ">=",
+                    c.min_edge_bps,
+                ),
+            ]
+        }
+        _ => Vec::new(),
+    });
+    json!(checks)
+}
+
 #[derive(Debug, Clone, Default)]
 struct Bucket {
     ts: i64,
@@ -522,7 +746,7 @@ struct Bucket {
     ask_low: Option<f64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct Feature {
     ret_15s: f64,
     ret_60s: f64,
@@ -557,7 +781,7 @@ struct AnalogForecast {
     neighbors: Vec<Neighbor>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 struct BarrierStats {
     samples: usize,
     wins: usize,
@@ -1094,6 +1318,11 @@ mod tests {
         assert_eq!(p.resolved_at, Some(2000));
         assert_eq!(p.exit_price, Some(103.));
         assert!(p.pnl_bps.unwrap() < 300.);
+        let trace = p.execution_audit.as_ref().unwrap();
+        assert!(!trace.complete_from_entry); // This fixture predates entry instrumentation.
+        assert_eq!(trace.quotes_observed, 1); // No observations from after the exit.
+        assert_eq!(trace.exit.as_ref().unwrap().code, "take_profit");
+        assert_eq!(trace.exit.as_ref().unwrap().quote.as_ref().unwrap().id, 1);
     }
     #[test]
     fn short_uses_ask_and_pays_costs() {
@@ -1134,12 +1363,26 @@ mod tests {
         assert_eq!(p.status, "DATA_GAP");
         assert_eq!(p.pnl_bps, None);
         assert_eq!(p.exit_price, None);
+        assert_eq!(
+            p.execution_audit
+                .as_ref()
+                .unwrap()
+                .exit
+                .as_ref()
+                .unwrap()
+                .code,
+            "timeout_quote_stale"
+        );
     }
     #[test]
     fn gap_before_a_target_hit_does_not_become_a_win() {
         let mut p = prediction();
         advance_position(&mut p, &[quote(1, 25000, 110., 110.1)], 25000, true);
         assert_eq!(p.status, "DATA_GAP");
+        let trace = p.execution_audit.as_ref().unwrap();
+        assert_eq!(trace.exit.as_ref().unwrap().code, "quote_gap");
+        assert_eq!(trace.max_observed_gap_ms, 24000);
+        assert!(trace.best.is_none()); // A gap followed by a favorable quote is not an observed win.
     }
     #[test]
     fn insufficient_book_liquidity_is_flagged() {
@@ -1148,6 +1391,9 @@ mod tests {
         q.bid_qty = 0.001;
         advance_position(&mut p, &[q], 2000, true);
         assert_eq!(p.status, "DATA_GAP");
+        let exit = p.execution_audit.as_ref().unwrap().exit.as_ref().unwrap();
+        assert_eq!(exit.code, "insufficient_exit_liquidity");
+        assert!(exit.available_base_qty.unwrap() < exit.required_base_qty);
     }
     #[test]
     fn thin_book_during_hold_does_not_invent_a_fill_or_close_the_trade() {
@@ -1169,6 +1415,16 @@ mod tests {
         q.event_ts = 1000;
         advance_position(&mut p, &[q], 12000, true);
         assert_eq!(p.status, "DATA_GAP");
+        assert_eq!(
+            p.execution_audit
+                .as_ref()
+                .unwrap()
+                .exit
+                .as_ref()
+                .unwrap()
+                .code,
+            "invalid_or_delayed_quote"
+        );
     }
     #[test]
     fn paginated_resolver_does_not_timeout_before_consuming_backlog() {
@@ -1266,16 +1522,24 @@ mod tests {
     fn partial_or_future_buckets_do_not_change_the_signal() {
         let at = 655000;
         let mut points: Vec<_> = (0..655)
-            .map(|n| point(n * 1000, 100. + n as f64 * 0.002))
+            .flat_map(|n| {
+                let q = point(n * 1000, 100. + n as f64 * 0.002);
+                let mut trade = q.clone();
+                trade.kind = "trade".into();
+                trade.qty = Some(3.);
+                trade.side = Some("BUY".into());
+                [q, trade]
+            })
             .collect();
         let c = LabConfig::default();
         let (a, _) = build_signals(&points, &points, Exchange::Binance, at, &c).unwrap();
+        assert!(!a.is_empty());
         points.push(point(at + 1000, 10000.));
         let (b, _) = build_signals(&points, &points, Exchange::Binance, at, &c).unwrap();
         let shape = |items: Vec<Signal>| {
             items
                 .into_iter()
-                .map(|s| (s.strategy, s.horizon, s.direction, s.stop_move))
+                .map(|s| (s.strategy, s.horizon, s.direction, s.stop_move, s.snapshot))
                 .collect::<Vec<_>>()
         };
         assert_eq!(shape(a), shape(b));
@@ -1328,6 +1592,26 @@ mod tests {
                 );
                 assert!(p.created_at >= at);
                 assert!(p.fee_bps > 0.);
+                let snapshot = p.entry_snapshot.as_ref().unwrap();
+                let cutoff = snapshot["history_cutoff_exclusive"].as_i64().unwrap();
+                assert!(snapshot["feature_quote_at"].as_i64().unwrap() < cutoff);
+                assert!(cutoff <= p.created_at);
+                assert_eq!(
+                    snapshot["execution"]["entry_fill_after_slippage"],
+                    p.entry_price
+                );
+                assert_eq!(snapshot["execution"]["decision_at"], p.created_at);
+                assert!(
+                    snapshot["rule_checks"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|g| g["passed"] == true)
+                );
+                assert!(snapshot["features"]["flow_60s"].as_f64().unwrap() > 0.);
+                let trace = p.execution_audit.as_ref().unwrap();
+                assert!(trace.complete_from_entry);
+                assert_eq!(trace.first.as_ref().unwrap().quote.id, p.cursor_id);
             }
             assert_eq!(manager.diagnostics(exchange).await.lanes.len(), 24);
         }

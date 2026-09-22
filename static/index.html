@@ -91,6 +91,31 @@
         </article>
       </section>
 
+      <section class="panel audit-panel" aria-labelledby="audit-title">
+        <div class="panel-heading">
+          <div><span class="eyebrow">ENTRY EVIDENCE → EXECUTION → OUTCOME</span><h2 id="audit-title">Position diagnostics · گزارش معاملات</h2></div>
+          <span class="badge">Both exchanges + archive</span>
+        </div>
+        <p class="research-note">Download JSON to share for analysis, or CSV for Excel. Exports include every matching position, including old configurations. New trades record the entry conditions and detailed exit reason; missing evidence on older trades is labeled.</p>
+        <div class="export-filters">
+          <label>Exchange<select id="export-exchange"><option value="all">Both exchanges</option><option value="binance">Binance</option><option value="bybit">Bybit</option></select></label>
+          <label>Configuration<select id="export-config"><option value="all">All · including archive</option><option value="current">Current configuration</option><option value="legacy">Legacy only</option></select></label>
+          <label>Strategy<select id="export-strategy"><option value="all">All strategies</option></select></label>
+          <label>Horizon<select id="export-horizon"><option value="all">All horizons</option><option value="60">1 minute</option><option value="300">5 minutes</option><option value="900">15 minutes</option><option value="3600">60 minutes</option></select></label>
+          <label>Symbol<input id="export-symbol" placeholder="All symbols" maxlength="24" autocomplete="off"></label>
+          <label>Exit status<select id="export-status"><option value="all">All outcomes + open</option><option value="LOSS">Stop hit · LOSS</option><option value="TIMEOUT">Time expired · TIMEOUT</option><option value="WIN">Target hit · WIN</option><option value="DATA_GAP">Data / fill gap</option><option value="OPEN">Still open</option></select></label>
+          <label>Entry from · local time<input id="export-from" type="datetime-local"></label>
+          <label>Entry before · local time<input id="export-to" type="datetime-local"></label>
+        </div>
+        <div class="export-actions">
+          <button id="export-json" class="primary">Download diagnostics JSON</button>
+          <button id="export-csv">Download CSV</button>
+          <button id="export-preview" class="accent">Preview loss breakdown</button>
+        </div>
+        <p id="export-message" class="research-note" role="status">Default: all dates, symbols, strategies and configurations on both exchanges. Download JSON and send the file for analysis.</p>
+        <div id="export-summary" hidden></div>
+      </section>
+
       <section class="comparison" aria-labelledby="comparison-title">
         <div class="panel-heading">
           <div><span class="eyebrow">SAME RULES · INDEPENDENT PAPER ACCOUNTS</span><h2 id="comparison-title">Strategy comparison · both exchanges</h2></div>
@@ -146,10 +171,11 @@
                   <th>Signal score</th>
                   <th>Status</th>
                   <th>Net bps</th>
+                  <th>Evidence</th>
                 </tr>
               </thead>
               <tbody id="prediction-body">
-                <tr><td colspan="10" class="empty">Start Auto Lab. Analysis and paper trading begin automatically after enough history is captured.</td></tr>
+                <tr><td colspan="11" class="empty">Start Auto Lab. Analysis and paper trading begin automatically after enough history is captured.</td></tr>
               </tbody>
             </table>
           </div>
@@ -183,6 +209,10 @@
   </div>
 
   <div id="toast" class="toast" hidden></div>
+  <dialog id="position-dialog" aria-labelledby="position-dialog-title">
+    <div class="panel-heading"><h2 id="position-dialog-title">Position evidence</h2><button id="position-close" aria-label="Close position evidence">Close</button></div>
+    <div id="position-detail"></div>
+  </dialog>
   <script src="/assets/app.js" defer></script>
 </body>
 </html>

@@ -71,6 +71,18 @@
   }
   $("comparison-horizon").addEventListener("change", renderComparisons);
   $("strategy-filter").addEventListener("change", () => renderPredictions(dashboards[exchange]?.predictions || []));
+  $("export-json").addEventListener("click", () => runExport("json"));
+  $("export-csv").addEventListener("click", () => runExport("csv"));
+  $("export-preview").addEventListener("click", () => runExport("summary"));
+  document.querySelectorAll(".export-filters input, .export-filters select").forEach(node => node.addEventListener("change", () => {
+    $("export-summary").hidden = true;
+    $("export-message").textContent = "Filters changed. Preview or download to get all matching positions.";
+  }));
+  $("position-close").addEventListener("click", () => $("position-dialog").close());
+  $("prediction-body").addEventListener("click", event => {
+    const button = event.target.closest("button[data-position-id]");
+    if (button) showPosition(button.dataset.positionId);
+  });
 
   function escapeHtml(value) {
     return String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -78,6 +90,99 @@
   function pct(value) { return (Number(value || 0) * 100).toFixed(1) + "%"; }
   function money(value) { return Number(value || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
   function signed(value) { return (Number(value) >= 0 ? "+" : "") + Number(value || 0).toFixed(2); }
+
+  function exportParams() {
+    const params = new URLSearchParams();
+    for (const name of ["exchange", "config", "strategy", "horizon", "status", "symbol"]) {
+      const value = $("export-" + name).value.trim();
+      if (value && value !== "all") params.set(name, value);
+    }
+    for (const [id, key] of [["export-from", "from_ms"], ["export-to", "to_ms"]]) {
+      if ($(id).value) {
+        const time = new Date($(id).value).getTime();
+        if (!Number.isFinite(time)) throw new Error("Enter a valid date and time.");
+        params.set(key, String(time));
+      }
+    }
+    return params;
+  }
+
+  async function runExport(format) {
+    const controls = document.querySelectorAll(".export-actions button, .export-filters input, .export-filters select");
+    controls.forEach(node => { node.disabled = true; });
+    $("export-message").textContent = "Preparing all matching positions…";
+    try {
+      const params = exportParams();
+      if (format === "summary") {
+        const result = await request("/api/exports/summary?" + params);
+        renderExportSummary(result);
+        $("export-message").textContent = result.position_count + " matching positions · snapshot " + new Date(result.generated_at).toLocaleString();
+      } else {
+        params.set("format", format);
+        const response = await fetch("/api/exports/positions?" + params);
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new Error(error.error || "Download failed (" + response.status + ")");
+        }
+        const blob = await response.blob();
+        const filename = response.headers.get("content-disposition")?.match(/filename="([^"]+)"/)?.[1] || "market-lab-positions." + format;
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url; link.download = filename;
+        document.body.appendChild(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        const count = response.headers.get("x-position-count") || "All matching";
+        $("export-message").textContent = count + " positions exported. " + (format === "json" ? "Send this JSON file for analysis of entries, exits and losses." : "CSV includes costs, outcome categories and entry/exit evidence.");
+      }
+    } catch (error) {
+      $("export-message").textContent = error.message;
+    } finally { controls.forEach(node => { node.disabled = false; }); }
+  }
+
+  function renderExportSummary(data) {
+    const c = data.counts;
+    const metrics = [["Closed positions", c.closed], ["Profitable", c.profitable], ["Stop losses", c.stop_losses],
+      ["Timeout losses", c.timeout_losses], ["Unverifiable data / fill", c.unverifiable], ["Fees changed profit to loss", c.fees_changed_profit_to_loss]];
+    const rows = (data.groups || []).map(g => {
+      const s = g.counts;
+      return '<tr>' + [g.exchange, g.symbol, g.config_id, g.strategy, g.horizon_secs / 60 + 'm', g.direction,
+        s.closed, s.profitable, s.losing, s.unverifiable,
+        g.net_win_rate_all_closed === null ? '—' : pct(g.net_win_rate_all_closed),
+        g.net_win_rate_priced_closed === null ? '—' : pct(g.net_win_rate_priced_closed),
+        money(g.known_net_pnl_quote)].map(value => '<td>' + escapeHtml(value) + '</td>').join('') + '</tr>';
+    }).join('');
+    $("export-summary").innerHTML = '<div class="audit-counts">' + metrics.map(([label, value]) => '<div><span>' + label + '</span><strong>' + Number(value || 0).toLocaleString() + '</strong></div>').join('') + '</div>' +
+      '<p class="research-note">' + c.open + ' open · ' + c.breakeven + ' flat · ' + c.other_losses + ' other losses. Fee-related losses overlap stop/timeout losses. ' + c.gave_back_observed_profit + ' losing trades were previously profitable at an observed executable quote.</p>' +
+      '<p class="research-note">Entry evidence missing: ' + c.missing_entry_snapshot + ' · Execution evidence missing: ' + c.missing_execution_audit + ' · Partial after upgrade: ' + c.partial_execution_audit + '. Unknown paths are shown separately from priced losses. Old records cannot reveal unrecorded entry features.</p>' +
+      '<div class="table-wrap"><table><thead><tr><th>Exchange</th><th>Symbol</th><th>Config</th><th>Strategy</th><th>Horizon</th><th>Side</th><th>Closed</th><th>Profit</th><th>Loss</th><th>Unknown</th><th>Win / all closed</th><th>Win / priced</th><th>Known PnL</th></tr></thead><tbody>' +
+      (rows || '<tr><td colspan="13" class="empty">No positions match these filters.</td></tr>') + '</tbody></table></div>' +
+      '<p class="research-note">Legacy rows use the original gross-price assumptions. Each configuration stays separate. Counts describe observed outcomes; they do not prove why the market moved.</p>';
+    $("export-summary").hidden = false;
+    const strategySelect = $("export-strategy");
+    for (const g of data.groups || []) {
+      if (!Array.from(strategySelect.options).some(option => option.value === g.strategy)) strategySelect.add(new Option(g.strategy, g.strategy));
+    }
+  }
+
+  async function showPosition(id) {
+    const dialog = $("position-dialog");
+    $("position-detail").textContent = "Loading recorded evidence…";
+    if (!dialog.open) dialog.showModal();
+    try {
+      const p = await request("/api/positions/" + encodeURIComponent(id));
+      const d = p.diagnosis;
+      const bps = value => value === null || value === undefined ? 'Not recorded' : signed(value) + ' bps';
+      const facts = [["Position", p.exchange + ' · ' + p.symbol + ' · ' + p.strategy + ' · ' + p.direction],
+        ["Entry time", new Date(p.created_at).toLocaleString()], ["Entry reason", p.entry_reason],
+        ["Exit", d.exit_reason + ' (' + d.exit_reason_source + ')'], ["Net result", bps(p.pnl_bps)],
+        ["Modeled fees paid", bps(d.fees_paid_bps)], ["Best observed net mark", bps(d.best_observed_net_bps)],
+        ["Worst observed net mark", bps(d.worst_observed_net_bps)], ["Entry evidence", d.entry_evidence], ["Path coverage", d.path_evidence]];
+      $("position-detail").innerHTML = '<div class="evidence-facts">' + facts.map(([label,value]) => '<p><span>' + label + '</span>' + escapeHtml(value) + '</p>').join('') + '</div>' +
+        '<p class="research-note">' + (p.entry_snapshot ? 'Entry values were stored when the signal was accepted. Scores are not win probabilities.' : 'This position predates detailed entry recording. Its missing conditions cannot be recovered from its final result.') + '</p>' +
+        '<details open><summary>Recorded entry conditions and thresholds</summary><pre>' + escapeHtml(JSON.stringify(p.entry_snapshot, null, 2)) + '</pre></details>' +
+        '<details><summary>Observed execution and exact exit reason</summary><pre>' + escapeHtml(JSON.stringify(p.execution_audit, null, 2)) + '</pre></details>';
+    } catch (error) { $("position-detail").textContent = error.message; }
+  }
 
   function renderComparisons() {
     const horizon = $("comparison-horizon").value;
@@ -205,7 +310,7 @@
     $("prediction-total").textContent = items.length + " signals";
     const body = $("prediction-body");
     if (!items.length) {
-      body.innerHTML = '<tr><td colspan="10" class="empty">No paper positions yet. Auto analysis starts with capture and opens positions after enough history is available.</td></tr>';
+      body.innerHTML = '<tr><td colspan="11" class="empty">No paper positions yet. Auto analysis starts with capture and opens positions after enough history is available.</td></tr>';
       return;
     }
 
@@ -226,6 +331,7 @@
         "<td>" + Number(item.score).toFixed(3) + "</td>" +
         '<td class="' + statusClass + '">' + item.status + "</td>" +
         "<td>" + pnl + "</td>" +
+        '<td><button class="evidence-button" data-position-id="' + escapeHtml(item.id) + '">Details</button></td>' +
         "</tr>";
     }).join("");
   }
@@ -295,6 +401,9 @@
       if (!data) throw new Error("Dashboard offline");
       if ($("strategy-filter").options.length === 1) {
         (data.strategies || []).forEach(s => $("strategy-filter").add(new Option(s.name, s.id)));
+      }
+      for (const s of data.strategies || []) {
+        if (!Array.from($("export-strategy").options).some(option => option.value === s.id)) $("export-strategy").add(new Option(s.name, s.id));
       }
       const capture = data.capture;
       if (capture.symbol && document.activeElement !== symbolInput) {

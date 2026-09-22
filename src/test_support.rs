@@ -32,6 +32,8 @@ pub fn prediction() -> Prediction {
         mark_price: Some(100.),
         max_gap_ms: 15000,
         entry_reason: "Test fixture, not market evidence".into(),
+        entry_snapshot: None,
+        execution_audit: None,
     }
 }
 pub fn quote(id: i64, ts: i64, bid: f64, ask: f64) -> Quote {

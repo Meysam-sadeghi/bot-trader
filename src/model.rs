@@ -143,6 +143,11 @@ pub struct Prediction {
     pub mark_price: Option<f64>,
     pub max_gap_ms: i64,
     pub entry_reason: String,
+    /// Immutable inputs captured when the position was opened. None for older rows.
+    #[serde(default)]
+    pub entry_snapshot: Option<serde_json::Value>,
+    #[serde(default)]
+    pub execution_audit: Option<crate::audit::ExecutionAudit>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]

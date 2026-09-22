@@ -3,6 +3,7 @@ use crate::{
     capture::CaptureManager,
     db::Database,
     event_bus::EventBus,
+    export::{self, ExportFilters},
     model::{Dashboard, Exchange},
     paper::{self, HORIZONS, STRATEGIES},
 };
@@ -47,6 +48,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/lab/stop", post(stop_both))
         .route("/api/dashboard/{exchange}", get(dashboard))
         .route("/api/predictions/{exchange}", get(predictions))
+        .route("/api/positions/{id}", get(position_details))
+        .route("/api/exports/positions", get(export_positions))
+        .route("/api/exports/summary", get(export_summary))
         .route("/ws/{exchange}", get(ws_upgrade))
         .nest_service("/assets", ServeDir::new("static"))
         .layer(CorsLayer::permissive())
@@ -313,6 +317,111 @@ async fn predictions(
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(json!({"predictions": items})))
+}
+
+async fn position_details(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<export::ExportPosition>, ApiError> {
+    let position = state
+        .db
+        .prediction_by_id(&id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "Position not found".into(),
+        })?;
+    Ok(Json(position.into()))
+}
+
+async fn build_export(
+    state: &AppState,
+    query: &HashMap<String, String>,
+) -> Result<export::ExportReport, ApiError> {
+    let filters =
+        ExportFilters::parse(query, &state.analysis.config.id()).map_err(|message| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message,
+        })?;
+    let snapshot = state.db.export_positions(&filters).await.map_err(|error| {
+        if error.downcast_ref::<export::ExportTooLarge>().is_some() {
+            ApiError {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                message: error.to_string(),
+            }
+        } else {
+            ApiError::internal(error)
+        }
+    })?;
+    tokio::task::spawn_blocking(move || export::report(snapshot, filters))
+        .await
+        .map_err(ApiError::internal)
+}
+
+async fn export_summary(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let report = build_export(&state, &query).await?;
+    Ok((
+        [("cache-control", "no-store")],
+        Json(export::summary_json(&report)),
+    )
+        .into_response())
+}
+
+async fn export_positions(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let format = query.get("format").map(String::as_str).unwrap_or("json");
+    if !matches!(format, "json" | "csv") {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Export format must be json or csv".into(),
+        });
+    }
+    let report = build_export(&state, &query).await?;
+    let count = report.position_count;
+    let filename = format!(
+        "market-lab-positions-{}-{}.{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+        count,
+        format
+    );
+    let is_csv = format == "csv";
+    let bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+        if is_csv {
+            Ok(export::csv(&report)?.into_bytes())
+        } else {
+            Ok(serde_json::to_vec(&report)?)
+        }
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::internal)?;
+    Ok((
+        [
+            (
+                "content-type",
+                if is_csv {
+                    "text/csv; charset=utf-8".into()
+                } else {
+                    "application/json; charset=utf-8".into()
+                },
+            ),
+            (
+                "content-disposition",
+                format!("attachment; filename=\"{filename}\""),
+            ),
+            ("cache-control", "no-store".into()),
+            ("x-position-count", count.to_string()),
+            ("x-content-type-options", "nosniff".into()),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 async fn ws_upgrade(

@@ -1,8 +1,10 @@
 mod analysis;
 mod api;
+mod audit;
 mod capture;
 mod db;
 mod event_bus;
+mod export;
 mod model;
 mod paper;
 #[cfg(test)]

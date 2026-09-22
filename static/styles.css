@@ -399,6 +399,33 @@ h3 small { color: var(--muted); font-size: 12px; font-weight: 400; }
 .trade-filter { display: block; margin-top: 10px; font-size: 11px; color: var(--muted); }
 .control-panel { flex-wrap: wrap; }
 .automation-strip { flex-wrap: wrap; }
+.audit-panel { padding: 20px; margin: 18px 0; }
+.export-filters { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.export-filters label { display: grid; gap: 6px; min-width: 0; color: var(--muted); font-size: 11px; }
+.export-filters input, .export-filters select { width: 100%; min-width: 0; height: 38px; }
+.export-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+button:disabled { cursor: wait; opacity: .6; }
+.audit-counts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 15px 0; }
+.audit-counts div { padding: 13px; border: 1px solid var(--line); border-radius: 10px; }
+.audit-counts span { display: block; color: var(--muted); font-size: 11px; }
+.audit-counts strong { display: block; font-size: 23px; margin-top: 5px; }
+.evidence-button { height: 28px; font-size: 10px; padding: 0 9px; }
+dialog { width: min(860px, calc(100vw - 28px)); max-height: 88vh; overflow: auto; background: var(--panel); color: var(--text); border: 1px solid #394b67; border-radius: 14px; padding: 22px; }
+dialog::backdrop { background: rgba(0, 0, 0, .75); }
+dialog pre { font-size: 11px; line-height: 1.6; background: #080d14; padding: 15px; border-radius: 9px; white-space: pre-wrap; overflow-wrap: anywhere; }
+dialog .evidence-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-size: 12px; }
+dialog .evidence-facts p { margin: 0; padding: 10px; background: var(--panel-2); border-radius: 7px; overflow-wrap: anywhere; }
+dialog .evidence-facts span { display: block; color: var(--muted); margin-bottom: 5px; }
+dialog details { margin-top: 16px; }
+dialog summary { cursor: pointer; color: var(--blue); font-size: 12px; }
+@media (max-width: 1050px) { .export-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 700px) {
+  .audit-panel > .panel-heading { align-items: flex-start; flex-direction: column; gap: 10px; }
+  .export-filters { grid-template-columns: 1fr; }
+  .export-actions button { flex: 1 1 180px; }
+  .audit-counts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  dialog .evidence-facts { grid-template-columns: 1fr; }
+}
 @media (max-width: 1250px) { .strategy-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 700px) {
   .strategy-grid { grid-template-columns: 1fr; }
