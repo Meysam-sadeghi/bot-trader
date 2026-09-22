@@ -4,6 +4,7 @@ use crate::{
     db::Database,
     event_bus::EventBus,
     model::{Dashboard, Exchange},
+    paper::{self, HORIZONS, STRATEGIES},
 };
 use axum::{
     Json, Router,
@@ -42,6 +43,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/analysis/{exchange}/stop", post(stop_analysis))
         .route("/api/data/{exchange}/clear", post(clear_data))
         .route("/api/system/update", post(update_system))
+        .route("/api/lab/start", post(start_both))
+        .route("/api/lab/stop", post(stop_both))
         .route("/api/dashboard/{exchange}", get(dashboard))
         .route("/api/predictions/{exchange}", get(predictions))
         .route("/ws/{exchange}", get(ws_upgrade))
@@ -70,7 +73,20 @@ async fn start_capture(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let exchange = parse_exchange(&exchange)?;
     let requested_symbol = normalize_symbol(params.symbol.as_deref().unwrap_or("BTCUSDT"))?;
-    let capture_started = state.capture.start(exchange, requested_symbol.clone()).await;
+    let current = state.capture.status(exchange).await;
+    if current.running && current.symbol != requested_symbol {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: "Stop this exchange before changing its symbol".into(),
+        });
+    }
+    let capture_started = state
+        .capture
+        .start(exchange, requested_symbol.clone())
+        .await;
+    if capture_started {
+        state.analysis.stop(exchange).await;
+    }
 
     // Starting capture also starts the analysis/paper-trading loop automatically.
     let active_symbol = state.capture.status(exchange).await.symbol;
@@ -83,6 +99,39 @@ async fn start_capture(
         "symbol": active_symbol,
         "automatic": true
     })))
+}
+
+async fn start_both(
+    State(state): State<AppState>,
+    Query(params): Query<StartParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let symbol = normalize_symbol(params.symbol.as_deref().unwrap_or("BTCUSDT"))?;
+    // Validate both before starting either, so a symbol conflict is never hidden.
+    for exchange in [Exchange::Binance, Exchange::Bybit] {
+        let current = state.capture.status(exchange).await;
+        if current.running && current.symbol != symbol {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: format!("Stop {exchange} before changing its symbol"),
+            });
+        }
+    }
+    for exchange in [Exchange::Binance, Exchange::Bybit] {
+        if state.capture.start(exchange, symbol.clone()).await {
+            state.analysis.stop(exchange).await;
+        }
+        state.analysis.start(exchange, symbol.clone()).await;
+    }
+    Ok(Json(
+        json!({"ok": true, "symbol": symbol, "exchanges": ["binance", "bybit"], "strategies_per_exchange": STRATEGIES.len()}),
+    ))
+}
+async fn stop_both(State(state): State<AppState>) -> Json<serde_json::Value> {
+    for exchange in [Exchange::Binance, Exchange::Bybit] {
+        state.analysis.stop(exchange).await;
+        state.capture.stop(exchange).await;
+    }
+    Json(json!({"ok": true}))
 }
 
 async fn stop_capture(
@@ -108,6 +157,12 @@ async fn start_analysis(
     let current = state.capture.status(exchange).await;
     let requested = params.symbol.as_deref().unwrap_or(&current.symbol);
     let symbol = normalize_symbol(requested)?;
+    if !current.running || current.symbol != symbol {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: "Start capture for this symbol first".into(),
+        });
+    }
     let started = state.analysis.start(exchange, symbol.clone()).await;
 
     Ok(Json(json!({
@@ -192,16 +247,25 @@ async fn dashboard(
         .count_events(exchange, &symbol)
         .await
         .map_err(ApiError::internal)?;
-    let stats = state
+    let config_id = state.analysis.config.id();
+    let mut predictions = state
         .db
-        .prediction_stats(exchange, &symbol)
+        .experiment_predictions(exchange, &symbol, &config_id)
         .await
         .map_err(ApiError::internal)?;
-    let predictions = state
+    let strategies = paper::reports(&predictions, &state.analysis.config);
+    let refs: Vec<_> = predictions.iter().collect();
+    let stats = paper::stats(
+        &refs,
+        state.analysis.config.initial_capital * HORIZONS.len() as f64 * STRATEGIES.len() as f64,
+        &state.analysis.config,
+    );
+    let archived_predictions = state
         .db
-        .recent_predictions(exchange, &symbol, 30)
+        .archived_count(exchange, &symbol, &config_id)
         .await
         .map_err(ApiError::internal)?;
+    predictions.truncate(120);
     let analysis_running = state.analysis.is_running(exchange).await;
 
     Ok(Json(Dashboard {
@@ -210,6 +274,11 @@ async fn dashboard(
         stored_events,
         stats,
         predictions,
+        strategies,
+        diagnostics: state.analysis.diagnostics(exchange).await,
+        config: state.analysis.config.clone(),
+        config_id,
+        archived_predictions,
     }))
 }
 
@@ -220,10 +289,7 @@ async fn predictions(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let exchange = parse_exchange(&exchange)?;
     let capture = state.capture.status(exchange).await;
-    let symbol = query
-        .get("symbol")
-        .cloned()
-        .unwrap_or(capture.symbol);
+    let symbol = query.get("symbol").cloned().unwrap_or(capture.symbol);
     let symbol = normalize_symbol(&symbol)?;
     let limit = query
         .get("limit")
@@ -231,9 +297,19 @@ async fn predictions(
         .unwrap_or(100)
         .clamp(1, 500);
 
+    let config_id = state.analysis.config.id();
+    let requested_config = query
+        .get("config")
+        .map(String::as_str)
+        .unwrap_or(&config_id);
+    let filter = if requested_config == "all" {
+        None
+    } else {
+        Some(requested_config)
+    };
     let items = state
         .db
-        .recent_predictions(exchange, &symbol, limit)
+        .recent_predictions(exchange, &symbol, filter, limit)
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(json!({"predictions": items})))
@@ -303,7 +379,9 @@ fn normalize_symbol(value: &str) -> Result<String, ApiError> {
     let symbol = value.trim().to_ascii_uppercase();
     if symbol.len() < 5
         || symbol.len() > 24
-        || !symbol.chars().all(|character| character.is_ascii_alphanumeric())
+        || !symbol
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
     {
         return Err(ApiError {
             status: StatusCode::BAD_REQUEST,

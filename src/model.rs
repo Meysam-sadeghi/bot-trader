@@ -50,7 +50,6 @@ pub struct MarketEvent {
 pub struct MarketPoint {
     pub kind: String,
     pub ts: i64,
-    pub price: Option<f64>,
     pub qty: Option<f64>,
     pub side: Option<String>,
     pub bid_price: Option<f64>,
@@ -134,6 +133,16 @@ pub struct Prediction {
     pub resolved_at: Option<i64>,
     pub exit_price: Option<f64>,
     pub pnl_bps: Option<f64>,
+    pub config_id: String,
+    pub fee_bps: f64,
+    pub slippage_bps: f64,
+    pub notional: f64,
+    pub gross_pnl_bps: Option<f64>,
+    pub cursor_id: i64,
+    pub last_quote_ts: i64,
+    pub mark_price: Option<f64>,
+    pub max_gap_ms: i64,
+    pub entry_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -145,6 +154,23 @@ pub struct PredictionStats {
     pub timeouts: i64,
     pub win_rate: f64,
     pub avg_pnl_bps: f64,
+    pub open: i64,
+    pub unmarked_open: i64,
+    pub invalid: i64,
+    pub breakeven: i64,
+    pub target_hits: i64,
+    pub strict_win_rate: f64,
+    pub win_rate_low: f64,
+    pub win_rate_high: f64,
+    pub net_pnl: f64,
+    pub unrealized_pnl: f64,
+    pub profit_factor: Option<f64>,
+    pub gross_profit: f64,
+    pub gross_loss: f64,
+    pub closed_drawdown_pct: f64,
+    pub initial_capital: f64,
+    pub return_pct: f64,
+    pub sample_ready: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,15 +180,11 @@ pub struct Dashboard {
     pub stored_events: i64,
     pub stats: PredictionStats,
     pub predictions: Vec<Prediction>,
-}
-
-pub fn strategy_mode(exchange: Exchange) -> &'static str {
-    // Version strategy labels whenever the decision engine changes materially.
-    // This keeps forward V2 statistics separate from the older baseline.
-    match exchange {
-        Exchange::Binance => "contrarian_selective_v2",
-        Exchange::Bybit => "normal_selective_v2",
-    }
+    pub strategies: Vec<crate::paper::StrategyReport>,
+    pub diagnostics: crate::paper::Diagnostics,
+    pub config: crate::paper::LabConfig,
+    pub config_id: String,
+    pub archived_predictions: i64,
 }
 
 pub fn now_ms() -> i64 {

@@ -32,7 +32,9 @@ impl CaptureContext {
             status.last_event_at = Some(event.received_ts);
             if let Some(price) = event.price {
                 status.last_price = Some(price);
-            } else if let (Some(bid), Some(ask)) = (event.bid_price, event.ask_price) {
+            } else if event.kind == "book_ticker"
+                && let (Some(bid), Some(ask)) = (event.bid_price, event.ask_price)
+            {
                 status.last_price = Some((bid + ask) / 2.0);
             }
             status.last_error = None;
@@ -73,11 +75,9 @@ impl CaptureManager {
     }
 
     pub async fn start(&self, exchange: Exchange, symbol: String) -> bool {
-        {
-            let tasks = self.tasks.read().await;
-            if tasks.contains_key(&exchange) {
-                return false;
-            }
+        let mut tasks = self.tasks.write().await;
+        if tasks.contains_key(&exchange) {
+            return false;
         }
 
         {
@@ -120,7 +120,7 @@ impl CaptureManager {
             manager.tasks.write().await.remove(&exchange);
         });
 
-        self.tasks.write().await.insert(exchange, task.abort_handle());
+        tasks.insert(exchange, task.abort_handle());
         true
     }
 
@@ -137,7 +137,6 @@ impl CaptureManager {
             false
         }
     }
-
 
     pub async fn reset_status(&self, exchange: Exchange) {
         let mut statuses = self.statuses.write().await;

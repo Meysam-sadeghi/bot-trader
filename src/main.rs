@@ -4,6 +4,9 @@ mod capture;
 mod db;
 mod event_bus;
 mod model;
+mod paper;
+#[cfg(test)]
+mod test_support;
 
 use analysis::AnalysisManager;
 use api::AppState;
@@ -27,13 +30,14 @@ async fn main() -> anyhow::Result<()> {
 
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string());
     std::fs::create_dir_all(&data_dir)?;
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| format!("sqlite://{data_dir}/market.db"));
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| format!("sqlite://{data_dir}/market.db"));
 
     let db = Database::connect(&database_url).await?;
     let bus = EventBus::new();
     let capture = CaptureManager::new(db.clone(), bus.clone());
     let analysis = AnalysisManager::new(db.clone());
+    db.register_config(&analysis.config).await?;
     analysis.spawn_resolver();
 
     let admin_token = std::env::var("ADMIN_TOKEN").unwrap_or_default();

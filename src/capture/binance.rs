@@ -37,14 +37,18 @@ async fn connect_once(context: CaptureContext) -> anyhow::Result<()> {
     .join("/");
     let url = format!("{base}/stream?streams={streams}");
 
-    let (mut socket, _) = connect_async(url.as_str())
-        .await
-        .with_context(|| format!("connect Binance websocket: {url}"))?;
+    let (mut socket, _) =
+        tokio::time::timeout(Duration::from_secs(15), connect_async(url.as_str()))
+            .await
+            .context("Binance websocket connection timed out")?
+            .with_context(|| format!("connect Binance websocket: {url}"))?;
 
     // The WS connection is opened first so depth deltas can queue while the REST
     // snapshot is fetched. The persisted snapshot lastUpdateId and each delta U/u
     // are sufficient to replay Binance's documented synchronization procedure.
-    capture_snapshot(&context).await?;
+    if let Err(error) = capture_snapshot(&context).await {
+        tracing::warn!(%error, "Binance depth archive snapshot unavailable; continuing independent bookTicker feed");
+    }
 
     tracing::info!(
         exchange = "binance",
@@ -53,7 +57,10 @@ async fn connect_once(context: CaptureContext) -> anyhow::Result<()> {
         "websocket connected"
     );
 
-    while let Some(message) = socket.next().await {
+    while let Some(message) = tokio::time::timeout(Duration::from_secs(60), socket.next())
+        .await
+        .context("Binance websocket received no messages for 60 seconds")?
+    {
         match message? {
             Message::Text(text) => {
                 let root: Value = serde_json::from_str(text.as_str())?;
@@ -168,14 +175,14 @@ fn normalize(stream: &str, data: &Value, symbol: &str) -> Option<MarketEvent> {
         }
     } else if stream.contains("@depth") {
         event.kind = "depth".to_string();
-        event.bid_price = nested_number(data.get("bids"), 0, 0)
-            .or_else(|| nested_number(data.get("b"), 0, 0));
-        event.bid_qty = nested_number(data.get("bids"), 0, 1)
-            .or_else(|| nested_number(data.get("b"), 0, 1));
-        event.ask_price = nested_number(data.get("asks"), 0, 0)
-            .or_else(|| nested_number(data.get("a"), 0, 0));
-        event.ask_qty = nested_number(data.get("asks"), 0, 1)
-            .or_else(|| nested_number(data.get("a"), 0, 1));
+        event.bid_price =
+            nested_number(data.get("bids"), 0, 0).or_else(|| nested_number(data.get("b"), 0, 0));
+        event.bid_qty =
+            nested_number(data.get("bids"), 0, 1).or_else(|| nested_number(data.get("b"), 0, 1));
+        event.ask_price =
+            nested_number(data.get("asks"), 0, 0).or_else(|| nested_number(data.get("a"), 0, 0));
+        event.ask_qty =
+            nested_number(data.get("asks"), 0, 1).or_else(|| nested_number(data.get("a"), 0, 1));
     } else if stream.contains("@kline_") {
         event.kind = "kline".to_string();
         if let Some(kline) = data.get("k") {

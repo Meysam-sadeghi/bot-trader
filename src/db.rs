@@ -1,4 +1,7 @@
-use crate::model::{strategy_mode, Exchange, MarketEvent, MarketPoint, Prediction, PredictionStats};
+use crate::{
+    model::{Exchange, MarketEvent, MarketPoint, Prediction},
+    paper::LabConfig,
+};
 use anyhow::Context;
 use sqlx::{
     Row, SqlitePool,
@@ -8,7 +11,7 @@ use std::{str::FromStr, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
 enum WriterCommand {
-    Event(MarketEvent),
+    Event(Box<MarketEvent>),
     Flush(oneshot::Sender<()>),
 }
 
@@ -108,11 +111,42 @@ impl Database {
             .execute(pool)
             .await?;
         }
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_predictions_strategy ON predictions(exchange, symbol, strategy, created_at)",
-        )
-        .execute(pool)
-        .await?;
+        // Additive migration: legacy outcomes and their original assumptions stay intact.
+        let existing: Vec<String> = columns
+            .iter()
+            .filter_map(|r| r.try_get("name").ok())
+            .collect();
+        for (name, definition) in [
+            ("config_id", "TEXT NOT NULL DEFAULT 'legacy'"),
+            ("fee_bps", "REAL NOT NULL DEFAULT 0"),
+            ("slippage_bps", "REAL NOT NULL DEFAULT 0"),
+            ("notional", "REAL NOT NULL DEFAULT 1000"),
+            ("gross_pnl_bps", "REAL"),
+            ("cursor_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_quote_ts", "INTEGER NOT NULL DEFAULT 0"),
+            ("mark_price", "REAL"),
+            ("max_gap_ms", "INTEGER NOT NULL DEFAULT 15000"),
+            (
+                "entry_reason",
+                "TEXT NOT NULL DEFAULT 'Legacy gross-price simulation'",
+            ),
+        ] {
+            if !existing.iter().any(|c| c == name) {
+                sqlx::query(&format!(
+                    "ALTER TABLE predictions ADD COLUMN {name} {definition}"
+                ))
+                .execute(pool)
+                .await?;
+            }
+        }
+        for statement in [
+            "CREATE TABLE IF NOT EXISTS lab_configs (id TEXT PRIMARY KEY, json TEXT NOT NULL, created_at INTEGER NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_predictions_config ON predictions(exchange, symbol, config_id, created_at)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_open_lane_v3 ON predictions(exchange, symbol, strategy, horizon_secs, config_id) WHERE status = 'OPEN' AND config_id != 'legacy'",
+            "CREATE INDEX IF NOT EXISTS idx_quotes_cursor ON market_events(exchange, symbol, id) WHERE kind = 'book_ticker'",
+        ] {
+            sqlx::query(statement).execute(pool).await?;
+        }
 
         Ok(())
     }
@@ -144,52 +178,44 @@ impl Database {
                     }
                 }
 
-                let mut tx = match pool.begin().await {
-                    Ok(tx) => tx,
-                    Err(error) => {
-                        tracing::error!(%error, "database begin failed");
-                        if let Some(done) = barrier {
-                            let _ = done.send(());
+                // Retain and retry the entire batch. A disk error must never silently
+                // drop market ticks and then acknowledge a successful flush.
+                loop {
+                    let result = async {
+                        let mut tx = pool.begin().await?;
+                        for event in &batch {
+                            sqlx::query(
+                                r#"INSERT INTO market_events (
+                                exchange, symbol, kind, event_ts, received_ts,
+                                price, qty, side, bid_price, bid_qty, ask_price, ask_qty, raw_json
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                            )
+                            .bind(event.exchange.to_string())
+                            .bind(&event.symbol)
+                            .bind(&event.kind)
+                            .bind(event.event_ts)
+                            .bind(event.received_ts)
+                            .bind(event.price)
+                            .bind(event.qty)
+                            .bind(&event.side)
+                            .bind(event.bid_price)
+                            .bind(event.bid_qty)
+                            .bind(event.ask_price)
+                            .bind(event.ask_qty)
+                            .bind(&event.raw_json)
+                            .execute(&mut *tx)
+                            .await?;
                         }
-                        continue;
+                        tx.commit().await
                     }
-                };
-
-                let mut failed = false;
-                for event in batch {
-                    let result = sqlx::query(
-                        r#"INSERT INTO market_events (
-                            exchange, symbol, kind, event_ts, received_ts,
-                            price, qty, side, bid_price, bid_qty, ask_price, ask_qty, raw_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
-                    )
-                    .bind(event.exchange.to_string())
-                    .bind(event.symbol)
-                    .bind(event.kind)
-                    .bind(event.event_ts)
-                    .bind(event.received_ts)
-                    .bind(event.price)
-                    .bind(event.qty)
-                    .bind(event.side)
-                    .bind(event.bid_price)
-                    .bind(event.bid_qty)
-                    .bind(event.ask_price)
-                    .bind(event.ask_qty)
-                    .bind(event.raw_json)
-                    .execute(&mut *tx)
                     .await;
-
-                    if let Err(error) = result {
-                        tracing::error!(%error, "database insert failed");
-                        failed = true;
-                        break;
+                    match result {
+                        Ok(()) => break,
+                        Err(error) => {
+                            tracing::error!(%error, "market batch retained; retrying database write");
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
                     }
-                }
-
-                if failed {
-                    let _ = tx.rollback().await;
-                } else if let Err(error) = tx.commit().await {
-                    tracing::error!(%error, "database commit failed");
                 }
 
                 if let Some(done) = barrier {
@@ -201,7 +227,7 @@ impl Database {
 
     pub async fn insert_event(&self, event: MarketEvent) -> anyhow::Result<()> {
         self.writer
-            .send(WriterCommand::Event(event))
+            .send(WriterCommand::Event(Box::new(event)))
             .await
             .context("market event writer closed")
     }
@@ -256,16 +282,19 @@ impl Database {
         symbol: &str,
         since_ms: i64,
         limit: i64,
+        until_ms: i64,
     ) -> anyhow::Result<Vec<MarketPoint>> {
         let rows = sqlx::query(
-            r#"SELECT kind, received_ts, price, qty, side,
+            r#"SELECT id, kind, received_ts, price, qty, side,
                       bid_price, bid_qty, ask_price, ask_qty
                FROM (
                    SELECT id, kind, received_ts, price, qty, side,
                           bid_price, bid_qty, ask_price, ask_qty
                    FROM market_events
                    WHERE exchange = ? AND symbol = ? AND received_ts >= ?
-                     AND kind IN ('trade', 'public_trade', 'book_ticker', 'kline')
+                     AND received_ts <= ?
+                     AND kind IN ('trade', 'public_trade', 'book_ticker')
+                     AND event_ts >= received_ts - 5000 AND event_ts <= received_ts + 1000
                    ORDER BY received_ts DESC, id DESC
                    LIMIT ?
                ) recent
@@ -274,6 +303,7 @@ impl Database {
         .bind(exchange.to_string())
         .bind(symbol)
         .bind(since_ms)
+        .bind(until_ms)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -283,7 +313,6 @@ impl Database {
                 Ok(MarketPoint {
                     kind: row.try_get("kind")?,
                     ts: row.try_get("received_ts")?,
-                    price: row.try_get("price")?,
                     qty: row.try_get("qty")?,
                     side: row.try_get("side")?,
                     bid_price: row.try_get("bid_price")?,
@@ -296,85 +325,75 @@ impl Database {
             .map_err(Into::into)
     }
 
-    pub async fn insert_prediction(&self, prediction: &Prediction) -> anyhow::Result<()> {
+    pub async fn register_config(&self, config: &LabConfig) -> anyhow::Result<()> {
+        let json = serde_json::to_string(config)?;
+        sqlx::query("INSERT OR IGNORE INTO lab_configs(id, json, created_at) VALUES (?, ?, ?)")
+            .bind(config.id())
+            .bind(&json)
+            .bind(crate::model::now_ms())
+            .execute(&self.pool)
+            .await?;
+        let stored: String = sqlx::query_scalar("SELECT json FROM lab_configs WHERE id = ?")
+            .bind(config.id())
+            .fetch_one(&self.pool)
+            .await?;
+        anyhow::ensure!(stored == json, "configuration identifier collision");
+        Ok(())
+    }
+
+    pub async fn insert_prediction(&self, p: &Prediction) -> anyhow::Result<()> {
         sqlx::query(
             r#"INSERT INTO predictions (
-                id, exchange, symbol, created_at, horizon_secs, direction,
-                entry_price, target_price, stop_price, confidence, score,
-                expected_return, strategy, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            id, exchange, symbol, created_at, horizon_secs, direction,
+            entry_price, target_price, stop_price, confidence, score, expected_return,
+            strategy, status, config_id, fee_bps, slippage_bps, notional,
+            cursor_id, last_quote_ts, mark_price, max_gap_ms, entry_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
-        .bind(&prediction.id)
-        .bind(prediction.exchange.to_string())
-        .bind(&prediction.symbol)
-        .bind(prediction.created_at)
-        .bind(prediction.horizon_secs)
-        .bind(&prediction.direction)
-        .bind(prediction.entry_price)
-        .bind(prediction.target_price)
-        .bind(prediction.stop_price)
-        .bind(prediction.confidence)
-        .bind(prediction.score)
-        .bind(prediction.expected_return)
-        .bind(&prediction.strategy)
-        .bind(&prediction.status)
+        .bind(&p.id)
+        .bind(p.exchange.to_string())
+        .bind(&p.symbol)
+        .bind(p.created_at)
+        .bind(p.horizon_secs)
+        .bind(&p.direction)
+        .bind(p.entry_price)
+        .bind(p.target_price)
+        .bind(p.stop_price)
+        .bind(p.confidence)
+        .bind(p.score)
+        .bind(p.expected_return)
+        .bind(&p.strategy)
+        .bind(&p.status)
+        .bind(&p.config_id)
+        .bind(p.fee_bps)
+        .bind(p.slippage_bps)
+        .bind(p.notional)
+        .bind(p.cursor_id)
+        .bind(p.last_quote_ts)
+        .bind(p.mark_price)
+        .bind(p.max_gap_ms)
+        .bind(&p.entry_reason)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    pub async fn has_open_prediction(
-        &self,
-        exchange: Exchange,
-        symbol: &str,
-        horizon_secs: i64,
-    ) -> anyhow::Result<bool> {
-        let row = sqlx::query(
-            r#"SELECT EXISTS(
-                   SELECT 1 FROM predictions
-                   WHERE exchange = ? AND symbol = ? AND horizon_secs = ?
-                     AND strategy = ? AND status = 'OPEN'
-               ) AS present"#,
-        )
-        .bind(exchange.to_string())
-        .bind(symbol)
-        .bind(horizon_secs)
-        .bind(strategy_mode(exchange))
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.try_get::<i64, _>("present")? != 0)
-    }
-
-    pub async fn has_recent_prediction(
-        &self,
-        exchange: Exchange,
-        symbol: &str,
-        horizon_secs: i64,
-        since_ms: i64,
-    ) -> anyhow::Result<bool> {
-        let row = sqlx::query(
-            r#"SELECT EXISTS(
-                   SELECT 1 FROM predictions
-                   WHERE exchange = ? AND symbol = ? AND horizon_secs = ?
-                     AND strategy = ? AND created_at >= ?
-               ) AS present"#,
-        )
-        .bind(exchange.to_string())
-        .bind(symbol)
-        .bind(horizon_secs)
-        .bind(strategy_mode(exchange))
-        .bind(since_ms)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.try_get::<i64, _>("present")? != 0)
-    }
-
     pub async fn open_predictions(&self) -> anyhow::Result<Vec<Prediction>> {
-        let rows = sqlx::query(
-            "SELECT * FROM predictions WHERE status = 'OPEN' ORDER BY created_at ASC LIMIT 500",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            sqlx::query("SELECT * FROM predictions WHERE status = 'OPEN' ORDER BY created_at, id")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.into_iter().map(row_to_prediction).collect()
+    }
+
+    pub async fn experiment_predictions(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        config_id: &str,
+    ) -> anyhow::Result<Vec<Prediction>> {
+        let rows = sqlx::query("SELECT * FROM predictions WHERE exchange = ? AND symbol = ? AND config_id = ? ORDER BY created_at DESC, id DESC")
+            .bind(exchange.to_string()).bind(symbol).bind(config_id).fetch_all(&self.pool).await?;
         rows.into_iter().map(row_to_prediction).collect()
     }
 
@@ -382,67 +401,63 @@ impl Database {
         &self,
         exchange: Exchange,
         symbol: &str,
+        config_id: Option<&str>,
         limit: i64,
     ) -> anyhow::Result<Vec<Prediction>> {
-        let rows = sqlx::query(
-            r#"SELECT * FROM predictions
-               WHERE exchange = ? AND symbol = ? AND strategy = ?
-               ORDER BY created_at DESC LIMIT ?"#,
-        )
-        .bind(exchange.to_string())
-        .bind(symbol)
-        .bind(strategy_mode(exchange))
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query("SELECT * FROM predictions WHERE exchange = ? AND symbol = ? AND (? IS NULL OR config_id = ?) ORDER BY created_at DESC, id DESC LIMIT ?")
+            .bind(exchange.to_string()).bind(symbol).bind(config_id).bind(config_id).bind(limit).fetch_all(&self.pool).await?;
         rows.into_iter().map(row_to_prediction).collect()
     }
 
-    pub async fn prediction_stats(
+    pub async fn archived_count(
         &self,
         exchange: Exchange,
         symbol: &str,
-    ) -> anyhow::Result<PredictionStats> {
-        let row = sqlx::query(
-            r#"SELECT
-                COUNT(*) AS total,
-                SUM(CASE WHEN status != 'OPEN' THEN 1 ELSE 0 END) AS resolved,
-                SUM(CASE WHEN status = 'WIN' THEN 1 ELSE 0 END) AS wins,
-                SUM(CASE WHEN status = 'LOSS' THEN 1 ELSE 0 END) AS losses,
-                SUM(CASE WHEN status = 'TIMEOUT' THEN 1 ELSE 0 END) AS timeouts,
-                AVG(CASE WHEN status != 'OPEN' THEN pnl_bps END) AS avg_pnl_bps
-               FROM predictions
-               WHERE exchange = ? AND symbol = ? AND strategy = ?"#,
+        config_id: &str,
+    ) -> anyhow::Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM predictions WHERE exchange = ? AND symbol = ? AND config_id != ?",
         )
         .bind(exchange.to_string())
         .bind(symbol)
-        .bind(strategy_mode(exchange))
+        .bind(config_id)
         .fetch_one(&self.pool)
-        .await?;
+        .await?)
+    }
 
-        let total = row.try_get::<i64, _>("total")?;
-        let resolved = row.try_get::<Option<i64>, _>("resolved")?.unwrap_or(0);
-        let wins = row.try_get::<Option<i64>, _>("wins")?.unwrap_or(0);
-        let losses = row.try_get::<Option<i64>, _>("losses")?.unwrap_or(0);
-        let timeouts = row.try_get::<Option<i64>, _>("timeouts")?.unwrap_or(0);
-        let avg_pnl_bps = row
-            .try_get::<Option<f64>, _>("avg_pnl_bps")?
-            .unwrap_or(0.0);
-        let win_rate = if resolved > 0 {
-            wins as f64 / resolved as f64
-        } else {
-            0.0
-        };
+    pub async fn latest_quote(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        at: i64,
+    ) -> anyhow::Result<Option<Quote>> {
+        let row = sqlx::query("SELECT id, received_ts, event_ts, bid_price, ask_price, bid_qty, ask_qty FROM market_events WHERE exchange = ? AND symbol = ? AND kind = 'book_ticker' AND received_ts <= ? ORDER BY received_ts DESC, id DESC LIMIT 1")
+            .bind(exchange.to_string()).bind(symbol).bind(at).fetch_optional(&self.pool).await?;
+        row.map(quote_from_row).transpose()
+    }
 
-        Ok(PredictionStats {
-            total,
-            resolved,
-            wins,
-            losses,
-            timeouts,
-            win_rate,
-            avg_pnl_bps,
-        })
+    pub async fn subsequent_quotes(
+        &self,
+        p: &Prediction,
+        until: i64,
+    ) -> anyhow::Result<Vec<Quote>> {
+        // Cursor prevents rescanning every tick since entry on every resolver iteration.
+        let rows = sqlx::query("SELECT id, received_ts, event_ts, bid_price, ask_price, bid_qty, ask_qty FROM market_events WHERE exchange = ? AND symbol = ? AND kind = 'book_ticker' AND id > ? AND received_ts > ? AND received_ts <= ? ORDER BY id ASC LIMIT 5000")
+            .bind(p.exchange.to_string()).bind(&p.symbol).bind(p.cursor_id).bind(p.created_at).bind(until).fetch_all(&self.pool).await?;
+        rows.into_iter().map(quote_from_row).collect()
+    }
+
+    pub async fn checkpoint(&self, p: &Prediction) -> anyhow::Result<()> {
+        sqlx::query("UPDATE predictions SET cursor_id = ?, last_quote_ts = ?, mark_price = ? WHERE id = ? AND status = 'OPEN'")
+            .bind(p.cursor_id).bind(p.last_quote_ts).bind(p.mark_price).bind(&p.id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn finish(&self, p: &Prediction) -> anyhow::Result<()> {
+        sqlx::query("UPDATE predictions SET status = ?, resolved_at = ?, exit_price = ?, pnl_bps = ?, gross_pnl_bps = ?, cursor_id = ?, last_quote_ts = ?, mark_price = ? WHERE id = ? AND status = 'OPEN'")
+            .bind(&p.status).bind(p.resolved_at).bind(p.exit_price).bind(p.pnl_bps).bind(p.gross_pnl_bps)
+            .bind(p.cursor_id).bind(p.last_quote_ts).bind(p.mark_price).bind(&p.id).execute(&self.pool).await?;
+        Ok(())
     }
 
     pub async fn first_crossing(
@@ -554,5 +569,229 @@ fn row_to_prediction(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Prediction>
         resolved_at: row.try_get("resolved_at")?,
         exit_price: row.try_get("exit_price")?,
         pnl_bps: row.try_get("pnl_bps")?,
+        config_id: row.try_get("config_id")?,
+        fee_bps: row.try_get("fee_bps")?,
+        slippage_bps: row.try_get("slippage_bps")?,
+        notional: row.try_get("notional")?,
+        gross_pnl_bps: row.try_get("gross_pnl_bps")?,
+        cursor_id: row.try_get("cursor_id")?,
+        last_quote_ts: row.try_get("last_quote_ts")?,
+        mark_price: row.try_get("mark_price")?,
+        max_gap_ms: row.try_get("max_gap_ms")?,
+        entry_reason: row.try_get("entry_reason")?,
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct Quote {
+    pub id: i64,
+    pub ts: i64,
+    pub event_ts: i64,
+    pub bid: f64,
+    pub ask: f64,
+    pub bid_qty: f64,
+    pub ask_qty: f64,
+}
+impl Quote {
+    pub fn valid(&self) -> bool {
+        [self.bid, self.ask, self.bid_qty, self.ask_qty]
+            .iter()
+            .all(|v| v.is_finite() && *v > 0.)
+            && self.ask >= self.bid
+            && self.event_ts >= self.ts - 5000
+            && self.event_ts <= self.ts + 1000
+    }
+    pub fn exit_price(&self, direction: &str) -> f64 {
+        if direction == "LONG" {
+            self.bid
+        } else {
+            self.ask
+        }
+    }
+    pub fn entry_qty(&self, direction: &str) -> f64 {
+        if direction == "LONG" {
+            self.ask_qty
+        } else {
+            self.bid_qty
+        }
+    }
+    pub fn exit_qty(&self, direction: &str) -> f64 {
+        if direction == "LONG" {
+            self.bid_qty
+        } else {
+            self.ask_qty
+        }
+    }
+}
+fn quote_from_row(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Quote> {
+    Ok(Quote {
+        id: row.try_get("id")?,
+        ts: row.try_get("received_ts")?,
+        event_ts: row.try_get("event_ts")?,
+        bid: row.try_get::<Option<f64>, _>("bid_price")?.unwrap_or(0.),
+        ask: row.try_get::<Option<f64>, _>("ask_price")?.unwrap_or(0.),
+        bid_qty: row.try_get::<Option<f64>, _>("bid_qty")?.unwrap_or(0.),
+        ask_qty: row.try_get::<Option<f64>, _>("ask_qty")?.unwrap_or(0.),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        paper::{HORIZONS, STRATEGIES},
+        test_support::{event, prediction},
+    };
+
+    #[tokio::test]
+    async fn forty_eight_lanes_are_independent_and_duplicate_open_lane_is_rejected() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let mut original = None;
+        for exchange in [Exchange::Binance, Exchange::Bybit] {
+            for (strategy, _, _) in STRATEGIES {
+                for horizon in HORIZONS {
+                    let mut p = prediction();
+                    p.exchange = exchange;
+                    p.strategy = strategy.into();
+                    p.horizon_secs = horizon;
+                    db.insert_prediction(&p).await.unwrap();
+                    original = Some(p);
+                }
+            }
+        }
+        assert_eq!(db.open_predictions().await.unwrap().len(), 48);
+        let mut duplicate = original.unwrap();
+        duplicate.id = uuid::Uuid::new_v4().to_string();
+        assert!(db.insert_prediction(&duplicate).await.is_err());
+        duplicate.config_id = "changed-costs".into();
+        db.insert_prediction(&duplicate).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_migration_is_additive_and_idempotent() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO predictions(id,exchange,symbol,created_at,horizon_secs,direction,entry_price,target_price,stop_price,confidence,score,expected_return,strategy,status,pnl_bps) VALUES ('old','binance','BTCUSDT',1,60,'LONG',100,103,99,0.8,0.5,0.02,'normal','WIN',300)")
+            .execute(&db.pool).await.unwrap();
+        // Simulate the actual pre-strategy schema, not merely a fresh empty database.
+        for name in ["idx_open_lane_v3", "idx_predictions_config"] {
+            sqlx::query(&format!("DROP INDEX {name}"))
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        for name in [
+            "strategy",
+            "config_id",
+            "fee_bps",
+            "slippage_bps",
+            "notional",
+            "gross_pnl_bps",
+            "cursor_id",
+            "last_quote_ts",
+            "mark_price",
+            "max_gap_ms",
+            "entry_reason",
+        ] {
+            sqlx::query(&format!("ALTER TABLE predictions DROP COLUMN {name}"))
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        Database::init_schema(&db.pool).await.unwrap();
+        Database::init_schema(&db.pool).await.unwrap();
+        let rows = db
+            .recent_predictions(Exchange::Binance, "BTCUSDT", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pnl_bps, Some(300.));
+        assert_eq!(rows[0].config_id, "legacy");
+        assert_eq!(rows[0].fee_bps, 0.);
+        assert_eq!(rows[0].strategy, "normal");
+        assert!(
+            db.experiment_predictions(Exchange::Binance, "BTCUSDT", &LabConfig::default().id())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn query_uses_quote_order_and_cursor_instead_of_trade_prices() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let mut p = prediction();
+        db.insert_event(event(Exchange::Binance, "trade", 2000, 104.))
+            .await
+            .unwrap();
+        db.insert_event(event(Exchange::Binance, "book_ticker", 2000, 100.))
+            .await
+            .unwrap();
+        db.insert_event(event(Exchange::Binance, "book_ticker", 2000, 98.))
+            .await
+            .unwrap();
+        db.insert_event(event(Exchange::Bybit, "book_ticker", 2000, 110.))
+            .await
+            .unwrap();
+        db.insert_event(event(Exchange::Binance, "book_ticker", 70000, 110.))
+            .await
+            .unwrap();
+        db.flush().await.unwrap();
+        let q = db.subsequent_quotes(&p, 61000).await.unwrap();
+        assert_eq!(q.len(), 2);
+        assert!(q[0].bid > q[1].bid);
+        p.cursor_id = q[0].id;
+        let later = db.subsequent_quotes(&p, 61000).await.unwrap();
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].id, q[1].id);
+    }
+
+    #[tokio::test]
+    async fn point_loader_honors_as_of_and_ignores_duplicated_or_stale_sources() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        for (kind, ts) in [
+            ("trade", 1000),
+            ("agg_trade", 1000),
+            ("kline", 1000),
+            ("book_ticker", 2000),
+            ("trade", 4000),
+        ] {
+            db.insert_event(event(Exchange::Binance, kind, ts, 100.))
+                .await
+                .unwrap();
+        }
+        let mut stale = event(Exchange::Binance, "book_ticker", 3000, 100.);
+        stale.event_ts = -5000;
+        db.insert_event(stale).await.unwrap();
+        db.flush().await.unwrap();
+        let points = db
+            .load_points(Exchange::Binance, "BTCUSDT", 0, 100, 3000)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].kind, "trade");
+        assert_eq!(points[1].kind, "book_ticker");
+    }
+
+    #[tokio::test]
+    async fn fee_snapshot_and_resolver_checkpoint_survive_database_round_trip() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let mut p = prediction();
+        p.fee_bps = 7.5;
+        db.insert_prediction(&p).await.unwrap();
+        p.cursor_id = 42;
+        p.last_quote_ts = 2300;
+        p.mark_price = Some(101.);
+        db.checkpoint(&p).await.unwrap();
+        let saved = db.open_predictions().await.unwrap().remove(0);
+        assert_eq!(saved.fee_bps, 7.5);
+        assert_eq!(saved.cursor_id, 42);
+        assert_eq!(saved.mark_price, Some(101.));
+        p.status = "WIN".into();
+        p.pnl_bps = Some(15.);
+        p.gross_pnl_bps = Some(30.);
+        p.resolved_at = Some(2500);
+        p.exit_price = Some(103.);
+        db.finish(&p).await.unwrap();
+        assert!(db.open_predictions().await.unwrap().is_empty());
+    }
 }

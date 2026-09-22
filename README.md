@@ -1,6 +1,6 @@
 # Market Lab — Realtime Crypto Market Research & Paper Trading
 
-A low-latency Rust service that captures live Spot market data from **Binance** and **Bybit**, persists normalized + raw events, analyzes market microstructure, finds similar historical patterns, produces forward paper-trade predictions, and measures its own strict win rate.
+A Rust research service that captures live spot market data from **Binance** and **Bybit**, runs six simultaneous paper strategies on each exchange, and measures forward net profitability under explicit execution assumptions.
 
 > This build is intentionally **paper trading only**. It does not submit real orders and does not require exchange API keys for public market data.
 
@@ -138,95 +138,68 @@ Separate pages:
 - `/binance`
 - `/bybit`
 
-Each page includes:
+Each exchange page now shows **both exchanges together**, with six comparison cards per exchange and a common 1 / 5 / 15 / 60 minute horizon selector. Use **Start BOTH exchanges** to run all 48 strategy/horizon lanes. The existing per-exchange Start/Stop controls remain available.
 
-- Symbol selection
-- Start Auto Lab / Stop
-- Automatic capture → analysis → simulated paper trading
-- Clear Data for the current exchange (Admin Token protected)
-- Update System from GitHub (Admin Token protected)
-- Live price chart
-- Live normalized event tape
-- Persisted event count
-- Paper-position table
-- 1 / 5 / 15 / 60 minute horizons
-- Maximum one open paper position per horizon
-- Fixed 1:3 risk/reward on every simulated position
-- Hard maximum holding time of 60 minutes
-- Direction, confidence, entry, target and stop
-- WIN / LOSS / TIMEOUT resolution
-- Strict win rate
-- Average paper PnL in basis points
+## Parallel Strategy Lab V3
 
-## Strategy modes
+Every exchange uses the same strategy definitions. Binance is no longer exclusively inverted: the old reversal idea is retained as a separate control on **both** exchanges.
 
-- **Binance: CONTRARIAN Selective V2** — every accepted model direction is still inverted, but weak/noisy setups are rejected before a paper trade is created.
-- **Bybit: NORMAL Selective V2** — follows the accepted model direction without inversion.
-- Take-profit / stop-loss remains fixed at **3:1 reward:risk** after the direction is inverted.
-- The maximum paper-position holding time remains **60 minutes**.
-- Predictions are tagged with their strategy mode. Existing historical Binance predictions are preserved as `normal`; the Binance dashboard and Strict Win Rate now report the current `contrarian` strategy separately, so the experiment starts with clean statistics without deleting captured market history.
+| Strategy | Entry condition | Purpose |
+| --- | --- | --- |
+| Order-flow follow | Aligned taker flow, persistent best-book imbalance and short momentum | Directional reference |
+| Order-flow reverse | Opposite direction at the same qualifying flow setup | Tests the contrarian hypothesis independently |
+| Trend pullback | Efficient five-minute trend, short pullback and a turn back toward the trend | Selective trend continuation |
+| Confirmed breakout | Breakout of the previous five-minute range plus volume, activity and flow confirmation | Momentum expansion |
+| Range reversion | Low trend efficiency, a range extreme and inward flow/acceleration | Range-bound conditions |
+| Selective consensus | Fresh agreement between venues plus cost-aware, purged historical analog evidence | High-selectivity research gate |
 
-This is an experiment on paper trades only. Inverting a historical win rate does not mathematically imply that the new win rate will equal `1 - old_win_rate`, because target/stop distances are asymmetric (3:1), timeouts exist, and path ordering determines whether TP or SL is reached first.
+These are deterministic research rules, **not a trained AI model or calibrated probabilities**. No strategy is known to achieve 80% forward wins. No forced trades are created when conditions are absent. In particular, selective consensus may wait a long time for enough independent data.
 
-## Prediction engine — Selective Signal V2
+Each `(exchange, symbol, strategy, horizon, configuration)` is an independent paper account:
 
-V2 is designed to improve **forward selectivity**, not to manufacture a backtest win rate. The default research gate asks for an 80% weighted strict win rate among similar historical analogs, but **80% is a target threshold, not a guarantee of future performance**. If the evidence is weak, the correct action is NO TRADE.
+- Initial capital defaults to **10,000 quote-asset units**, fixed entry notional **1,000 quote-asset units** (USDT for BTCUSDT; no conversion to USD).
+- One open position per account; cooldown starts at the previous **exit**.
+- Gross target/stop distance remains **3:1** for every strategy. Net reward/risk is lower after costs.
+- Horizons are exactly 60 / 300 / 900 / 3,600 seconds. The UI's all-horizons view combines **four independent accounts**, not one shared leveraged account.
+- New entries require enough account equity and visible best-quote size for the notional.
+- All material configuration values form a stable experiment ID; the full configuration is stored in `lab_configs`. Changing costs or gates creates a new cohort. Each position also persists its own execution assumptions.
+- Existing V1/V2 data remains untouched under the `legacy` cohort. Already-open legacy positions finish using the previous gross-price model. Their results are never pooled with V3.
 
-Events are aggregated into continuous 5-second research windows. Missing windows are filled so 1/5/15/60-minute horizons remain clock-time accurate. Features now include:
+## Market data and execution assumptions
 
-1. 15-second, 60-second and 5-minute log returns
-2. Momentum acceleration
-3. 15-second, 60-second and 5-minute taker-flow imbalance
-4. 60-second and 5-minute realized volatility
-5. Current and persistent top-book imbalance
-6. Bid/ask spread in basis points
-7. Relative traded volume
-8. Relative trade intensity
-9. 5-minute trend efficiency
-10. Position inside the recent 5-minute range
-11. Optional cross-exchange Binance/Bybit microstructure confirmation
+Research features use **closed five-second windows**, mid prices from complete best quotes, and deduplicated-by-stream taker flow (raw trade/publicTrade, never aggTrade plus trade). Kline closes and arbitrary full-depth delta levels cannot overwrite the feature price. Long quote outages remain missing rather than being filled indefinitely. Stale peers cannot confirm a signal.
 
-For every analysis iteration the engine:
+Bybit subscribes to `orderbook.1.SYMBOL` in addition to the raw full-depth archive: its spot ticker is a last-price feed, not the executable best-book source. A full-depth delta's first updated row is not necessarily the best price. Archive snapshot failures are logged without blocking the independent best-quote stream. References: [Bybit level-1 orderbook](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook), [Bybit ticker](https://bybit-exchange.github.io/docs/v5/websocket/public/ticker), [Binance bookTicker](https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md#individual-symbol-book-ticker-streams).
 
-1. Builds the enriched microstructure feature vector.
-2. Searches a configurable longer history for similar states.
-3. De-correlates neighboring analogs in time so adjacent 5-second samples are not treated as independent evidence.
-4. Estimates forward return and direction probability from the nearest analogs.
-5. Builds the same fixed 1:3 TP/SL geometry used by the paper trade.
-6. Replays each historical analog forward and measures **which barrier was hit first**: TP, SL, or timeout.
-7. Treats an ambiguous bucket that touched both TP and SL as a loss, avoiding optimistic backtest bias.
-8. Computes weighted strict win probability plus a Wilson lower confidence bound.
-9. Applies spread, edge, confidence, minimum-sample and re-entry cooldown gates.
-10. Opens a paper position only when all gates pass; otherwise it records no forced trade.
+V3 simulation:
 
-Binance still uses the requested CONTRARIAN direction rule, but V2 only permits the inverted trade when historical barrier evidence supports it. Bybit remains NORMAL.
+1. Compute the signal from history available at that time; fetch a fresh quote after computation. Never backdate an entry.
+2. LONG enters at ask plus adverse slippage; SHORT enters at bid minus adverse slippage.
+3. LONG exits against bid; SHORT exits against ask, with adverse exit slippage. Evaluate subsequent quote events in persisted arrival order, including a deterministic ID tiebreaker.
+4. Cap favorable target gaps at the target price. Preserve the worse actual fill on adverse stop gaps.
+5. Deduct entry and exit fees on their respective notionals. Defaults are **10 bps per side fee and 1 bp per side slippage**, research assumptions that must be adjusted to the actual account tier. Spread is already in fills; it is not charged twice.
+6. At timeout, use the last sufficiently recent executable quote. If the path contains an excessive quote gap, stale/crossed quote, insufficient visible exit liquidity or no usable deadline quote, mark **DATA_GAP**, leave PnL unknown and retain it in the win-rate denominator.
+7. Persist resolver cursors and marks, so restarts resume ordered evaluation without rescanning every historical tick. Market-write failures retain and retry batches instead of silently losing observations.
 
-A useful statistical reference: with a symmetric random walk and a take-profit three times farther away than the stop, the theoretical TP-before-SL probability is about 25%. Therefore a 25–30% win rate with 3:1 reward:risk is not automatically a losing system; expectancy, timeouts, fees and slippage matter as much as raw win rate.
+This is a **top-book paper approximation**, not an execution guarantee. SHORT is synthetic spot-price research; margin borrowing, funding, queue priority, execution latency, full-depth market impact and account order restrictions are not modeled. The collectors send no real orders and require no exchange API keys.
 
-## Forward-only evaluation
+## Historical evidence versus forward performance
 
-Predictions are written before their outcome is known.
+Selective consensus uses past analogs with disjoint **feature + outcome windows** and a full feature-window embargo before the current state. Labels must be complete. Historical barrier replay uses executable bid/ask sides and the same fee/slippage arithmetic; an ambiguous five-second bar is scored conservatively as a loss. Gapped paths are not labeled. Expected net return, weighted and unweighted net target-hit rates, minimum samples and a Wilson lower bound must all pass.
 
-Each prediction stores:
+Historical analog evidence is a **selection heuristic**, not out-of-sample performance. With a one-hour horizon and a 24-hour lookback, 24 disjoint analog paths generally cannot fit; the lane correctly waits. Raw event caps can shorten effective history further, which the UI explicitly reports. Increase history/capacity only when the server can support it.
 
-- creation time
-- exchange and symbol
-- horizon
-- LONG / SHORT
-- entry
-- target
-- stop
-- confidence
-- model score
-- expected return
+Dashboard cards show **forward-only** positions recorded before their outcomes:
 
-A separate resolver looks only at **subsequent** real trade events:
+- **Net win rate** = positive-net closed positions / **all** closed positions. Profitable timeouts count as net wins; losses, flat exits, losing timeouts and DATA_GAP remain in the denominator.
+- **Net TP hit rate** = target hits with positive net PnL / all closed positions. It does not relabel a profitable timeout as a target hit.
+- Sample size and descriptive 95% Wilson interval. A tiny 100%-winning sample is not evidence for an 80% sustainable strategy.
+- Realized net PnL, unrealized PnL at the last quote, net expectancy per priced trade, net profit factor, return on allocated capital and **closed-trade** drawdown.
+- Closed-trade drawdown excludes intratrade adverse movement. Unknown DATA_GAP PnL is not included in monetary totals; any account with such gaps is incomplete.
+- The 80% lower-bound marker requires at least 100 closed positions, no data gaps, positive net PnL and an individual horizon's Wilson lower bound at/above the configured target. It **does not authorize real trading** or establish future performance. Serial correlation and strategy selection can make statistical intervals overconfident.
+- A per-lane reason explains waiting, filters, missing evidence, open positions or cooldown. Zero trades are shown as **no result**, not 0% performance.
 
-- **WIN** — target is reached first
-- **LOSS** — stop is reached first
-- **TIMEOUT** — the horizon expires before either level is reached; no position can remain open beyond 60 minutes
-
-This prevents back-filled wins from contaminating the displayed win rate.
+Run forward collection across multiple regimes, compare fixed configurations on fresh data, and inspect net profitability and drawdown alongside hit rate. The repository has no production database or historic performance report attached, so the software tests cannot establish an achieved live-market win rate.
 
 ## Persistence
 
@@ -238,6 +211,7 @@ Important tables:
 
 - `market_events`
 - `predictions`
+- `lab_configs`
 
 Every market row contains normalized analysis fields plus the original raw JSON payload.
 
@@ -281,21 +255,26 @@ BYBIT_WS_URL=wss://stream.bybit.com/v5/public/spot
 BYBIT_REST_BASE=https://api.bybit.com
 
 ANALYSIS_INTERVAL_SECS=30
-MAX_POSITION_SECS=3600
 
-# Selective Signal Engine V2.
+# Parallel Strategy Lab V3.
 # TARGET_STRICT_WIN_RATE is a historical analog admission threshold,
 # not a promise that forward results will equal this percentage.
 ANALYSIS_LOOKBACK_HOURS=24
 ANALYSIS_MAX_POINTS=750000
 TARGET_STRICT_WIN_RATE=0.80
-MIN_SIGNAL_CONFIDENCE=0.72
 MIN_WIN_LOWER_BOUND=0.55
 MIN_SIGNAL_EDGE_BPS=2.0
 MAX_SPREAD_BPS=3.0
 MIN_ANALOG_SAMPLES=24
 ANALOG_NEIGHBORS=80
 REENTRY_COOLDOWN_SECS=180
+MAX_QUOTE_AGE_MS=5000
+MAX_DATA_GAP_MS=15000
+BINANCE_TAKER_FEE_BPS=10
+BYBIT_TAKER_FEE_BPS=10
+PAPER_SLIPPAGE_BPS=1
+PAPER_NOTIONAL=1000
+PAPER_INITIAL_CAPITAL=10000
 
 # Admin actions are disabled when this is empty.
 # Ubuntu installer generates this automatically in /etc/market-lab.env.
@@ -330,6 +309,8 @@ POST /api/analysis/binance/start?symbol=BTCUSDT
 POST /api/analysis/binance/stop
 POST /api/analysis/bybit/start?symbol=BTCUSDT
 POST /api/analysis/bybit/stop
+POST /api/lab/start?symbol=BTCUSDT
+POST /api/lab/stop
 ```
 
 Protected administration:
@@ -349,6 +330,7 @@ GET /api/dashboard/binance
 GET /api/dashboard/bybit
 GET /api/predictions/binance
 GET /api/predictions/bybit
+GET /api/predictions/binance?config=all&limit=500
 ```
 
 Browser realtime stream:
@@ -382,23 +364,11 @@ Bybit WS + REST snapshot ──┘             │
                                          win rate + paper PnL
 ```
 
-## Next research upgrades
+## Validation and remaining research
 
-The current code establishes the complete capture → storage → analysis → prediction → validation loop. High-value next work:
+`cargo test --locked --all-targets` exercises execution costs, quote ordering, stop gaps, timeouts, data outages, legacy migrations, restart checkpoints, cohort separation, independent lanes, closed-window/no-future signals, purged analogs and both exchange flows. Synthetic fixtures prove software behavior only; they are not profitable-strategy evidence.
 
-- In-memory sequence-validated local order book state for both exchanges
-- Cross-exchange Binance/Bybit lead-lag features
-- Multi-level depth imbalance (1/5/10/25/50 bps)
-- Order-book slope, replenishment and cancellation pressure
-- CVD, trade intensity and inter-arrival time
-- Spoof-resistance / fleeting-liquidity features
-- Market regime detection
-- Walk-forward training and validation partitions
-- Replay/backtest using the exact same event structures
-- XGBoost/LightGBM or sequence model trained from exported features
-- ClickHouse / Parquet archival
-- Prometheus capture-gap and latency metrics
-- Optional authenticated **testnet** execution only after paper results demonstrate stable out-of-sample performance
+Further research before any separate live-execution project includes chronological replay on real captured datasets, held-out regimes, parameter selection bias, full-depth fills/latency/borrowing and intratrade portfolio drawdown. No real-trading switch is included.
 
 ## CI
 
@@ -407,8 +377,8 @@ GitHub Actions validates both Ubuntu shell scripts and runs:
 ```bash
 bash -n scripts/install-ubuntu.sh
 bash -n scripts/update-ubuntu.sh
-cargo check --all-targets
-cargo test --all-targets
+cargo check --locked --all-targets
+cargo test --locked --all-targets
 ```
 
 on feature branches and pull requests.

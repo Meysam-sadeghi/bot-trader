@@ -53,7 +53,9 @@
           <input id="symbol" value="BTCUSDT" maxlength="24" autocomplete="off">
         </div>
         <button id="start-capture" class="primary">Start Auto Lab</button>
-        <button id="stop-capture">Stop</button>
+        <button id="stop-capture">Stop exchange</button>
+        <button id="start-both" class="primary">Start BOTH exchanges</button>
+        <button id="stop-both">Stop both</button>
         <button id="clear-data" class="danger">Clear Data</button>
         <button id="update-system" class="accent">Update System</button>
       </section>
@@ -62,7 +64,7 @@
         <strong>Automatic mode</strong>
         <span>Capture → Analyze → Paper Trade</span>
         <span id="strategy-mode">Strategy: loading…</span>
-        <span>Risk : Reward = 1 : 3</span>
+        <span>Gross risk : reward = 1 : 3</span>
         <span>Maximum hold = 60 minutes</span>
       </section>
 
@@ -75,18 +77,36 @@
         <article class="metric panel">
           <span>Captured events</span>
           <strong id="event-count">0</strong>
-          <small>Persisted to SQLite WAL</small>
+          <small>Recorded market observations</small>
         </article>
         <article class="metric panel">
-          <span>Strict win rate · current strategy</span>
+          <span>Net win rate · all research lanes</span>
           <strong id="win-rate">0.00%</strong>
           <small id="resolved-count">0 resolved paper positions</small>
         </article>
         <article class="metric panel">
-          <span>Average paper PnL</span>
+          <span>Average net PnL / closed trade</span>
           <strong id="avg-pnl">0.00 bps</strong>
-          <small>Includes timeout exits</small>
+          <small>Fees + slippage + timeout exits included</small>
         </article>
+      </section>
+
+      <section class="comparison" aria-labelledby="comparison-title">
+        <div class="panel-heading">
+          <div><span class="eyebrow">SAME RULES · INDEPENDENT PAPER ACCOUNTS</span><h2 id="comparison-title">Strategy comparison · both exchanges</h2></div>
+          <label class="horizon-control" for="comparison-horizon">Compare horizon
+            <select id="comparison-horizon">
+              <option value="60">1 minute</option>
+              <option value="300" selected>5 minutes</option>
+              <option value="900">15 minutes</option>
+              <option value="3600">60 minutes</option>
+              <option value="all">All · 4 separate accounts</option>
+            </select>
+          </label>
+        </div>
+        <p class="research-note">80% is a research target, not a promised result. Net win rate counts every closed position, including timeouts and data gaps. Each strategy and horizon has its own equal starting capital. Balances use the pair’s quote asset (USDT for BTCUSDT). Rule scores are not win probabilities.</p>
+        <div id="comparison-exchanges" aria-live="polite"><p class="empty">Loading strategy accounts…</p></div>
+        <p class="research-note">95% Wilson intervals are descriptive and assume independent trials; market regimes and overlapping horizons can correlate results. Closed-trade drawdown excludes intratrade moves. SHORT positions are synthetic spot-price research; borrowing, funding, queue priority and execution latency are not modeled.</p>
       </section>
 
       <section class="chart-panel panel">
@@ -108,6 +128,7 @@
             <div>
               <span class="eyebrow">MODEL OUTPUT</span>
               <h2>Automatic paper positions</h2>
+              <label class="trade-filter" for="strategy-filter">Strategy <select id="strategy-filter"><option value="all">All current strategies</option></select></label>
             </div>
             <span id="prediction-total" class="badge">0 signals</span>
           </div>
@@ -116,18 +137,19 @@
               <thead>
                 <tr>
                   <th>Time</th>
+                  <th>Strategy</th>
                   <th>Horizon</th>
                   <th>Side</th>
                   <th>Entry</th>
                   <th>Target</th>
                   <th>Stop</th>
-                  <th>Conf.</th>
+                  <th>Signal score</th>
                   <th>Status</th>
-                  <th>PnL</th>
+                  <th>Net bps</th>
                 </tr>
               </thead>
               <tbody id="prediction-body">
-                <tr><td colspan="9" class="empty">Start Auto Lab. Analysis and paper trading begin automatically after enough history is captured.</td></tr>
+                <tr><td colspan="10" class="empty">Start Auto Lab. Analysis and paper trading begin automatically after enough history is captured.</td></tr>
               </tbody>
             </table>
           </div>
@@ -151,11 +173,10 @@
           <h2>Microstructure + historical analog matching</h2>
         </div>
         <p>
-          Start Auto Lab runs capture, analysis and simulated trading together. The engine combines
-          taker buy/sell flow, best-book imbalance, momentum, spread and realized volatility, then
-          compares the current 5-second feature state with historical analogs. Paper positions are
-          evaluated at 1, 5, 15 and 60 minute horizons, use a fixed 1:3 stop-loss/take-profit ratio,
-          and no simulated position is allowed to remain open longer than 60 minutes.
+          Start BOTH exchanges collects Binance and Bybit data and evaluates all six strategies at 1, 5, 15 and 60 minutes.
+          Signals use completed windows; the selective model uses past, non-overlapping analog paths and fresh peer confirmation.
+          Each strategy/horizon may hold one position. The spread, fees and adverse slippage are included in net results.
+          Historical results keep their original configuration. A data gap is flagged instead of inventing an exit price.
         </p>
       </section>
     </main>

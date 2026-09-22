@@ -8,14 +8,14 @@
   const pricePoints = [];
   const liveEvents = [];
   let socket;
+  let dashboards = {};
+  let refreshing = false;
   let perSecond = 0;
   let lastRateAt = Date.now();
 
   $("exchange-title").textContent = displayExchange;
   document.title = displayExchange + " Market Lab";
-  $("strategy-mode").textContent = exchange === "binance"
-    ? "Strategy: CONTRARIAN — model signal inverted"
-    : "Strategy: NORMAL — model signal followed";
+  $("strategy-mode").textContent = "6 strategies × 4 horizons per exchange";
   document.querySelectorAll(".nav-link").forEach((link) => {
     link.classList.toggle("active", link.dataset.exchange === exchange);
   });
@@ -60,6 +60,67 @@
 
   $("start-capture").addEventListener("click", () => action("capture-start"));
   $("stop-capture").addEventListener("click", () => action("capture-stop"));
+  for (const operation of ["start", "stop"]) {
+    $(operation + "-both").addEventListener("click", async () => {
+      try {
+        await request("/api/lab/" + operation + "?symbol=" + encodeURIComponent(symbol()), { method: "POST" });
+        toast(operation === "start" ? "Both exchanges started · all 24 strategy/horizon lanes per exchange" : "Both exchanges stopped");
+        await refresh();
+      } catch (error) { toast(error.message); }
+    });
+  }
+  $("comparison-horizon").addEventListener("change", renderComparisons);
+  $("strategy-filter").addEventListener("change", () => renderPredictions(dashboards[exchange]?.predictions || []));
+
+  function escapeHtml(value) {
+    return String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  }
+  function pct(value) { return (Number(value || 0) * 100).toFixed(1) + "%"; }
+  function money(value) { return Number(value || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
+  function signed(value) { return (Number(value) >= 0 ? "+" : "") + Number(value || 0).toFixed(2); }
+
+  function renderComparisons() {
+    const horizon = $("comparison-horizon").value;
+    $("comparison-exchanges").innerHTML = ["binance", "bybit"].map(key => {
+      const data = dashboards[key];
+      if (!data) return '<div class="panel feed-diagnostic">' + escapeHtml(key) + ': comparison data unavailable</div>';
+      const diag = data.diagnostics || {};
+      const config = data.config || {};
+      const active = data.capture.running && data.analysis_running;
+      const stale = !data.capture.last_event_at || Date.now() - data.capture.last_event_at > 15000;
+      const fee = key === "binance" ? config.binance_fee_bps : config.bybit_fee_bps;
+      const header = '<div class="exchange-comparison-header"><h3>' + (key === "binance" ? "Binance" : "Bybit") + ' <small>' + escapeHtml(data.capture.symbol) + '</small></h3>' +
+        '<span class="badge ' + (active && !stale ? 'active' : '') + '">' + (active ? (stale ? "Waiting for fresh feed" : "Lab running") : "Stopped") + '</span></div>';
+      const notice = '<div class="feed-diagnostic">' + escapeHtml(data.capture.last_error || diag.message) +
+        '<small>History: ' + Number(diag.history_minutes || 0).toFixed(1) + ' min' + (diag.history_truncated ? ' · History capped by event limit' : '') +
+        ' · Fee assumption: ' + Number(fee).toFixed(1) + ' bps / side · Slippage: ' + Number(config.slippage_bps).toFixed(1) +
+        ' bps / side · Notional: ' + money(config.notional) + ' per trade' +
+        ' · Archive: ' + (data.archived_predictions || 0) + ' older/config-changed positions' +
+        ' · <a href="/api/predictions/' + key + '?config=all&amp;limit=500" target="_blank" rel="noopener">Inspect archive JSON</a></small></div>';
+      const cards = (data.strategies || []).map(strategy => {
+        const lane = (strategy.horizons || []).find(h => String(h.horizon_secs) === horizon);
+        const stats = lane ? lane.stats : strategy.stats;
+        const reason = (diag.lanes || []).find(d => d.strategy === strategy.id && String(d.horizon_secs) === horizon)?.reason || (horizon === "all" ? "Four separate accounts combined; inspect each horizon before comparing." : diag.message);
+        const n = Number(stats.resolved || 0);
+        const pf = stats.profit_factor === null ? (stats.gross_profit > 0 ? "No losses yet" : "—") : Number(stats.profit_factor).toFixed(2);
+        const assessment = n < config.min_forward_trades ? "Early sample · " + n + "/" + config.min_forward_trades + " closed" : (stats.invalid ? "Incomplete paths · inspect data gaps" : (stats.sample_ready && lane ? "80% lower bound reached · keep validating" : "Forward evidence · target not established"));
+        return '<article class="strategy-card panel"><div class="strategy-heading"><h4>' + escapeHtml(strategy.name) + '</h4><span class="badge">' + stats.open + ' open</span></div>' +
+          '<p class="strategy-description">' + escapeHtml(strategy.description) + '</p>' +
+          '<div class="strategy-primary"><div><span>Net win rate</span><strong>' + (n ? pct(stats.win_rate) : '—') + '</strong><small>' + (n ? stats.wins + ' profitable / ' + n + ' closed' : 'Awaiting closed positions') + '</small></div>' +
+          '<div><span>Known realized net PnL</span><strong class="' + (stats.net_pnl < 0 ? 'negative' : 'positive') + '">' + money(stats.net_pnl) + '</strong><small>Account: ' + money(stats.initial_capital) + '</small></div></div>' +
+          '<dl class="strategy-details"><div><dt>95% interval</dt><dd>' + (n ? pct(stats.win_rate_low) + '–' + pct(stats.win_rate_high) : '—') + '</dd></div>' +
+          '<div><dt>Net TP hit rate</dt><dd>' + (n ? pct(stats.strict_win_rate) : '—') + '</dd></div>' +
+          '<div><dt>Profit factor</dt><dd>' + pf + '</dd></div><div><dt>Avg net / trade</dt><dd>' + signed(stats.avg_pnl_bps) + ' bps</dd></div>' +
+          '<div><dt>Closed drawdown</dt><dd>' + Number(stats.closed_drawdown_pct).toFixed(2) + '%</dd></div>' +
+          '<div><dt>Open PnL · last quote</dt><dd>' + (stats.unmarked_open ? 'Incomplete mark' : money(stats.unrealized_pnl)) + '</dd></div>' +
+          '<div><dt>Return incl. open</dt><dd>' + (stats.invalid || stats.unmarked_open ? 'Incomplete' : signed(stats.return_pct) + '%') + '</dd></div>' +
+          '<div><dt>Loss / flat / timeout</dt><dd>' + stats.losses + ' / ' + stats.breakeven + ' / ' + stats.timeouts + '</dd></div>' +
+          '<div><dt>Data / fill gaps</dt><dd class="' + (stats.invalid ? 'negative' : '') + '">' + stats.invalid + '</dd></div></dl>' +
+          '<p class="sample-state">' + escapeHtml(assessment) + '</p><p class="lane-reason">' + escapeHtml(reason) + '</p></article>';
+      }).join('');
+      return '<section class="exchange-comparison">' + header + notice + '<div class="strategy-grid">' + cards + '</div></section>';
+    }).join('');
+  }
 
   function getAdminToken() {
     let token = sessionStorage.getItem("marketLabAdminToken") || "";
@@ -139,10 +200,12 @@
   }
 
   function renderPredictions(items) {
+    const strategy = $("strategy-filter").value;
+    items = items.filter(item => strategy === "all" || item.strategy === strategy);
     $("prediction-total").textContent = items.length + " signals";
     const body = $("prediction-body");
     if (!items.length) {
-      body.innerHTML = '<tr><td colspan="9" class="empty">No paper positions yet. Auto analysis starts with capture and opens positions after enough history is available.</td></tr>';
+      body.innerHTML = '<tr><td colspan="10" class="empty">No paper positions yet. Auto analysis starts with capture and opens positions after enough history is available.</td></tr>';
       return;
     }
 
@@ -154,12 +217,13 @@
         : (item.pnl_bps >= 0 ? "+" : "") + Number(item.pnl_bps).toFixed(2);
       return "<tr>" +
         "<td>" + formatTime(item.created_at) + "</td>" +
+        "<td title=\"" + escapeHtml(item.entry_reason) + "\">" + escapeHtml(item.strategy.replace("_v3", "")) + "</td>" +
         "<td>" + Math.round(item.horizon_secs / 60) + "m</td>" +
         '<td class="' + sideClass + '">' + item.direction + "</td>" +
         "<td>" + formatPrice(item.entry_price) + "</td>" +
         "<td>" + formatPrice(item.target_price) + "</td>" +
         "<td>" + formatPrice(item.stop_price) + "</td>" +
-        "<td>" + (Number(item.confidence) * 100).toFixed(1) + "%</td>" +
+        "<td>" + Number(item.score).toFixed(3) + "</td>" +
         '<td class="' + statusClass + '">' + item.status + "</td>" +
         "<td>" + pnl + "</td>" +
         "</tr>";
@@ -191,7 +255,7 @@
   function pushLiveEvent(event) {
     perSecond += 1;
     const price = event.price ?? (
-      event.bid_price && event.ask_price
+      event.kind === "book_ticker" && event.bid_price && event.ask_price
         ? (Number(event.bid_price) + Number(event.ask_price)) / 2
         : null
     );
@@ -209,16 +273,29 @@
       const sideClass = side === "BUY" ? "buy" : side === "SELL" ? "sell" : "";
       return '<div class="event-row">' +
         "<span>" + formatTime(item.ts) + "</span>" +
-        '<span class="kind">' + item.kind + "</span>" +
+        '<span class="kind">' + escapeHtml(item.kind) + "</span>" +
         "<span>" + formatPrice(item.price ?? item.bid_price) + "</span>" +
-        '<span class="' + sideClass + '">' + side + "</span>" +
+        '<span class="' + sideClass + '">' + escapeHtml(side) + "</span>" +
         "</div>";
     }).join("");
   }
 
   async function refresh() {
+    if (refreshing) return;
+    refreshing = true;
     try {
-      const data = await request("/api/dashboard/" + exchange);
+      const results = await Promise.allSettled(["binance", "bybit"].map(async key => [key, await request("/api/dashboard/" + key)]));
+      results.forEach((result, i) => {
+        const key = ["binance", "bybit"][i];
+        if (result.status === "fulfilled") dashboards[key] = result.value[1];
+        else delete dashboards[key];
+      });
+      renderComparisons();
+      const data = dashboards[exchange];
+      if (!data) throw new Error("Dashboard offline");
+      if ($("strategy-filter").options.length === 1) {
+        (data.strategies || []).forEach(s => $("strategy-filter").add(new Option(s.name, s.id)));
+      }
       const capture = data.capture;
       if (capture.symbol && document.activeElement !== symbolInput) {
         symbolInput.value = capture.symbol;
@@ -232,7 +309,7 @@
       if (capture.last_price) $("last-price").textContent = formatPrice(capture.last_price);
 
       const stats = data.stats || {};
-      $("win-rate").textContent = ((Number(stats.win_rate) || 0) * 100).toFixed(2) + "%";
+      $("win-rate").textContent = stats.resolved ? pct(stats.win_rate) : "—";
       $("resolved-count").textContent = (stats.resolved || 0) + " resolved paper positions";
       const avg = Number(stats.avg_pnl_bps) || 0;
       $("avg-pnl").textContent = (avg >= 0 ? "+" : "") + avg.toFixed(2) + " bps";
@@ -246,7 +323,7 @@
       }
     } catch (error) {
       $("status-text").textContent = "API offline";
-    }
+    } finally { refreshing = false; }
   }
 
   function connectSocket() {
@@ -269,5 +346,5 @@
 
   refresh();
   connectSocket();
-  setInterval(refresh, 1500);
+  setInterval(refresh, 5000);
 })();
